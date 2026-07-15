@@ -2,8 +2,8 @@
 
 > ## 🚀 第83轮启动！PRD v2.2 Phase 1 — 证据链 + 6阶段DAG预备
 
-**最后更新**：2026-07-15 15:17（第83轮 — PRD v2.2 Phase 1 启动）
-**阶段**：第83轮 — R-004 6阶段DAG + Evidence Schema 预备
+**最后更新**：2026-07-15 15:54（第83轮 — PRD v2.2 Phase 1 完成 ✅）
+**阶段**：第83轮 — Evidence Graph + 并行采集骨架 ✅ 部署完成
 
 **最后更新**：2026-07-15 12:22（第82轮 — Codex 审查修复 ✅ 3/3 完成）
 **阶段**：第82轮 Codex 审查修复 — quality_score 上限 90 ✅ 端口统一 8180 ✅ 报告结构完整 ✅
@@ -1684,3 +1684,15 @@ sshpass -p 'DingYi_aiagent_20260602' ssh root@120.79.20.232 '
 - **P0-3 evidence_graph**：[✅/🟡] 输出含 evidence_graph，claims=N 条
 - **P0-4 并行采集骨架**：[✅/🟡] _fetch_parallel_evidence() 可用，并行测试通过
 ```
+
+---
+
+### 执行回执 2026-07-15 15:54（第83轮 — PRD v2.2 Phase 1）
+- **P0-3 evidence_graph**：✅ 输出含 `evidence_graph` 字段
+  - `/api/v1/listing/generate` — evidence_graph 字段已添加，含 sources/total_claims/claims/data_insufficient
+  - `/api/v1/listing/generate/react` — 同 evidence_graph 字段
+- **P0-4 并行采集骨架**：✅ `_fetch_parallel_evidence()` 可用
+  - `listing/evidence_collector.py` — 新建文件（~200 行）
+  - `concurrent.futures.ThreadPoolExecutor` 并行调用 ISR subtask
+  - 30s 超时控制 + degraded 降级
+  - 预留评论VOC/类目趋势/合规检查（Phase 2 接入）
