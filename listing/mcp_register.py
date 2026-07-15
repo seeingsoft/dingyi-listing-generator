@@ -10,7 +10,7 @@ import sys
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-PCE_API_BASE = os.environ.get("PCE_API_BASE", "http://localhost:8080")
+PCE_API_BASE = os.environ.get("PCE_API_BASE", "http://127.0.0.1:8180")
 
 LISTING_CAPABILITY = {
     "name": "listing-generate",

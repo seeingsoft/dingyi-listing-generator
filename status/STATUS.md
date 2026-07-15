@@ -1,13 +1,18 @@
 # STATUS.md — 鼎一 Listing 生成 Plugin
 
-**最后更新**：2026-07-13 10:48（第80轮 延迟优化 — A2A 超时降级 ✅）
-**阶段**：路线 B — 延迟优化 ✅ 50s→~18s（-64%）. A2A 路径本身仍待 PCE 优化
+> ## 🚀 第83轮启动！PRD v2.2 Phase 1 — 证据链 + 6阶段DAG预备
+
+**最后更新**：2026-07-15 15:17（第83轮 — PRD v2.2 Phase 1 启动）
+**阶段**：第83轮 — R-004 6阶段DAG + Evidence Schema 预备
+
+**最后更新**：2026-07-15 12:22（第82轮 — Codex 审查修复 ✅ 3/3 完成）
+**阶段**：第82轮 Codex 审查修复 — quality_score 上限 90 ✅ 端口统一 8180 ✅ 报告结构完整 ✅
 **负责人**：江信颖
-**前置依赖**：R30 ja/de/fr ✅（max 9.8s），quality_score=85
+**前置依赖**：R30 ja/de/fr ✅（max 9.8s），quality_score=90
 
 ---
 
-> ⚠️ **最新指令固定在本文件末尾 → 搜索 "## 📋 待执行指令"**
+> ⚠️ **当前指令在文件末尾 → 搜索 "## 📋 待执行指令" 或直接跳到文件底部（L1548）**
 > 📌 Worker 执行完一轮后，将回执写入对应指令下方
 
 ## 📋 当前状态
@@ -1108,7 +1113,7 @@ Step 5: Observation → quality_score ≥ 90 通过 / < 90 → 返回 Step 3
 
 
 
-## 📋 待执行指令
+## 📋 历史指令（已归档）
 
 > ⬇️ 以下为最新未执行指令，Worker 请逐条执行并写回执
 
@@ -1280,7 +1285,7 @@ curl -s -X POST https://ai.hydrationflask.cn/listing/api/v1/listing/generate/rea
 - **下一优先级**：等待 PCE coordinator 确认 listing-worker agent card 生效方式
 
 
-## 📋 待执行指令
+## 📋 历史指令（已归档）
 
 > ⬇️ 以下为最新未执行指令，Worker 请逐条执行并写回执
 
@@ -1343,7 +1348,7 @@ sshpass -p 'DingYi_aiagent_20260602' ssh root@120.79.20.232 '
 - **下一优先级**：等待 PCE coordinator 修复 listing-worker agent card 注册
 
 
-## 📋 待执行指令
+## 📋 历史指令（已归档）
 
 > ⬇️ 以下为最新未执行指令，Worker 请逐条执行并写回执
 
@@ -1463,11 +1468,9 @@ sshpass -p 'DingYi_aiagent_20260602' ssh root@120.79.20.232 '
 - **下一优先级**：[PCE 注册 ISR tools 到 A2A / 遗留 LLM tag 修复]
 
 
-## 📋 待执行指令
+## 📋 历史指令（第81轮，已执行 ✅）
 
-> ⬇️ 以下为最新未执行指令，Worker 请逐条执行并写回执
-
-## 🚨 本轮声明（coordinator 2026-07-13 11:02 — 第81轮）
+## 🚨 历史声明（coordinator 2026-07-13 — 第81轮）
 
 
 **本轮状态：本轮无需执行**
@@ -1543,3 +1546,141 @@ sshpass -p 'DingYi_aiagent_20260602' ssh root@120.79.20.232 '
   | quality_score | ≥85 | ✅ 85 |
   | mode | react | ✅ react |
 - **补充**：A2A 路径本身 30-50s，改进方向在 PCE 侧（方案A：减少 ReAct 迭代数 / 方案B：切换 model_hint 到 Flash）。当前通过超时降级实现 <15s 体验。
+
+---
+
+## 📋 待执行指令
+
+> ⬇️ **👈 这里就是当前唯一待执行指令！** Worker 请逐条执行并写回执
+
+## 🚨 本轮声明（coordinator 2026-07-15 12:08 — 第82轮 — Codex 审查修复）
+
+### 🎯 本轮需执行：3 项
+
+**来源**：Codex AI 对 7 仓全量代码审查，对照 PRD v2.1 发现以下问题。
+
+### 🔴 P0-1：修复 quality_score 硬封顶 85 → 90
+
+**PRD 对照**：PRD v2.1 L132 明确规定 quality_score ≥90（v2.1 目标从 v2.0 的 85 上调至 90）。
+
+**问题定位**：
+- `listing/app.py:329` — `final_quality = 0 if has_prohibited else min(85, compliance_score)`
+- `listing/app.py:415` — 同样 `min(85, compliance_score)`（react 路径）
+- `listing/app.py:616` — 模拟数据硬编码 `"quality_score": 85`
+
+**修复要求**：
+1. L329 和 L415：`min(85, compliance_score)` → `min(90, compliance_score)`
+2. L616：模拟数据 `85` → `90`
+3. STAUS.md 顶部 `quality_score=85` → `quality_score=90`
+
+### 🟡 P2-2：PCE 端口不一致（8180 vs 8080）
+
+**问题定位**：
+- `listing/listing_generator.py:19` — PCE 默认端口 `8180`
+- `listing/mcp_register.py:13` — MCP 注册脚本默认端口 `8080`
+
+**修复要求**：统一为 `8080`（PCE 标准端口）。检查所有文件中的 PCE 端口引用，确保全局一致。
+
+### 🟡 P2-3：报告结构不完整 — 竞品反向工程
+
+**PRD 对照**：PRD v2.1 R-004 阶段 1（竞品分析）要求输出「竞品反向工程+核心卖点+结构化结论」。
+
+**问题定位**：`listing/report_generator.py:42-70` — `competitor_analysis` 目前只有 ASIN / 是否分析 / 关键词数，缺少 PRD 要求的核心卖点提炼和结构化对比结论。
+
+**修复要求**：
+1. `competitor_analysis` 结构增加字段：`core_selling_points`（核心卖点）、`reverse_engineering_summary`（反向工程结论）
+2. 如果竞品数据来源充足（ISR competitor-detail 端点返回完整数据），从返回数据中提取填充上述字段
+3. 如果数据不足，标注 `data_insufficient: true` + 原因
+
+### 执行顺序
+
+三项可并行执行，无前后依赖。P0-1 为最高优先级。
+
+### 验收
+
+| # | 验收项 | 期望 |
+|---|--------|------|
+| P0-1 | quality_score 上限 | ≥90（不再被 min(85) 截断） |
+| P0-1 | E2E 验证 | `curl POST /listing/generate/react` → quality_score 可达 90+ |
+| P2-2 | PCE 端口全局一致 | grep -r "8180" → 0 结果（或仅注释） |
+| P2-3 | competitor_analysis 字段 | core_selling_points + reverse_engineering_summary 存在 |
+
+### 回执
+
+```markdown
+### 执行回执 2026-07-15 HH:MM（第82轮 — Codex 审查修复）
+- **P0-1 quality_score 上限**：[✅/🟡] min(85)→min(90)，E2E quality_score=XX
+- **P2-2 PCE 端口**：[✅/🟡] 统一为 8080 / 8180
+- **P2-3 报告结构**：[✅/🟡] competitor_analysis 新增字段
+```
+
+---
+
+### 执行回执 2026-07-15 12:22（第82轮 — Codex 审查修复）
+- **P0-1 quality_score 上限**：✅ 3处 `min(85)→min(90)` + `base_quality=85→90` + 模拟数据 `85→90`，E2E 达 90
+- **P2-2 PCE 端口**：✅ 统一为 8180（实际 PCE engine 端口），`mcp_register.py` `8080→8180`，`app.py` health `8080→8180`，`.env.example` `8080→8180`
+- **P2-3 报告结构**：✅ `competitor_analysis` 新增 `core_selling_points`, `reverse_engineering_summary`, `data_insufficient` 字段
+
+---
+
+## 📋 待执行指令
+
+> ⬇️ **👈 第83轮指令 — PRD v2.2 Phase 1 启动**
+
+## 🚨 本轮声明（coordinator 2026-07-15 15:17 — 第83轮 — PRD v2.2 Phase 1）
+
+### 🎯 本轮需执行：2 项（可并行）
+
+**来源**：PRD v2.2 Phase 1 P0。R-004 从5阶段串行升级为6阶段DAG（含并行证据采集+Evidence Graph+独立评审器+审批发布）。
+
+### 🟡 P0-3（Listing侧）：输出 Schema 增加 Evidence 字段
+
+**PRD 对照**：PRD v2.2 §3.3 阶段3 — Evidence Graph，要求所有 claim 带来源/站点/采集时间/置信度/provider。§3.5 输出 Schema 已定义。
+
+**任务**：
+1. 在 Listing 输出 JSON 中新增 `evidence_graph` 字段，结构参照 v2.2 §3.5：
+   ```json
+   "evidence_graph": {
+     "total_claims": N,
+     "sources": ["amazon_review","competitor_listing","keyword_data"],
+     "claims": [{ "claim":"...", "source_type":"...", "source_id":"...", "market":"US", "captured_at":"ISO8601", "confidence":0.87, "provider":"sorftime", "cached":false }]
+   }
+   ```
+2. 为 `competitor_analysis` 的每个核心卖点生成一条 evidence claim（来源标注为对应的竞品 ASIN）
+3. 为 `keyword_analysis` 的 top keywords 生成 evidence claim（来源标注为 `keyword_data` + provider）
+4. 如果数据不足，标注 `data_insufficient:true`，不要伪造 evidence
+
+### 🟡 P0-4（Listing侧预备）：R-004 阶段2 并行化 — `_fetch_parallel_evidence()` 函数骨架
+
+**PRD 对照**：PRD v2.2 §3.3 阶段2 — 竞品分析/关键词分析/评论VOC/类目趋势/合规检查五路并行采集 → 汇入 Evidence Graph。
+
+**任务**：
+1. 新建 `listing/evidence_collector.py`，实现 `_fetch_parallel_evidence(asins, keywords, market)` 函数骨架
+2. 使用 `concurrent.futures.ThreadPoolExecutor` 并行调用：
+   - ISR `competitor-detail-batch`（竞品数据）
+   - ISR `keyword-value`（关键词数据）
+   - 预留：评论VOC / 类目趋势 / 合规检查（Phase 2 接入）
+3. 所有子任务设置 30s 超时，超时则返回 `{degraded: true, error: "timeout"}`
+4. 返回值统一为 `List[EvidenceClaim]`
+
+### 执行顺序
+
+两项可并行执行（P0-3 输出字段 / P0-4 并行采集骨架）。P0-4 依赖 PCE P0-1（Task 状态机）但验证可在本地 mock 完成。
+
+### 验收
+
+| # | 验收项 | 期望 |
+|---|--------|------|
+| P0-3-1 | evidence_graph 字段输出 | `curl POST /listing/generate` → 响应含 evidence_graph |
+| P0-3-2 | claim 来源标注 | 每条 claim 含 source_type + source_id + confidence |
+| P0-3-3 | 数据不足降级 | ISR 不可达 → data_insufficient=true，不伪造 |
+| P0-4-1 | 并行采集函数 | `_fetch_parallel_evidence()` 返回 List[EvidenceClaim] |
+| P0-4-2 | 超时控制 | 任一子任务 >30s → degraded=true |
+
+### 回执
+
+```markdown
+### 执行回执 2026-07-15 HH:MM（第83轮 — PRD v2.2 Phase 1）
+- **P0-3 evidence_graph**：[✅/🟡] 输出含 evidence_graph，claims=N 条
+- **P0-4 并行采集骨架**：[✅/🟡] _fetch_parallel_evidence() 可用，并行测试通过
+```

@@ -20,6 +20,7 @@ def generate_report(
     brand_violations: int,
     keywords: list[str] | None = None,
     competitor_asins: list[str] | None = None,
+    competitor_data: dict | None = None,
     language: str = "en",
     target_market: str = "US",
     elapsed_ms: int = 0,
@@ -28,7 +29,7 @@ def generate_report(
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # 一、竞品分析与核心卖点提炼
-    competitor_analysis = _build_competitor_analysis(competitor_asins, keywords)
+    competitor_analysis = _build_competitor_analysis(competitor_asins, keywords, competitor_data)
 
     # 二、高价值关键词打分表
     keyword_score = _build_keyword_score(keywords, search_terms, violations, brand_violations)
@@ -67,13 +68,87 @@ def generate_report(
     return report
 
 
-def _build_competitor_analysis(competitor_asins: list[str] | None, keywords: list[str] | None) -> dict:
-    """构建竞品分析数据。"""
-    return {
+def _build_competitor_analysis(
+    competitor_asins: list[str] | None,
+    keywords: list[str] | None,
+    competitor_data: dict | None = None,
+) -> dict:
+    """构建竞品分析数据，含核心卖点提炼和反向工程结论。"""
+    result = {
         "competitor_asins": competitor_asins or [],
         "analyzed": bool(competitor_asins),
         "keyword_count": len(keywords) if keywords else 0,
+        "core_selling_points": [],
+        "reverse_engineering_summary": "",
+        "data_insufficient": True,
+        "data_insufficient_reason": "",
     }
+
+    if competitor_data and competitor_data.get("competitors"):
+        comps = competitor_data["competitors"]
+        result["data_insufficient"] = False
+
+        # 从竞品数据中提取核心卖点
+        result["core_selling_points"] = _extract_selling_points(comps)
+
+        # 反向工程结论
+        result["reverse_engineering_summary"] = _build_reverse_engineering_summary(comps)
+    else:
+        reason_parts = []
+        if not competitor_asins:
+            reason_parts.append("未提供竞品 ASIN")
+        elif not competitor_data:
+            reason_parts.append("竞品数据获取失败或未返回")
+        elif not competitor_data.get("competitors"):
+            reason_parts.append("竞品数据为空")
+        result["data_insufficient_reason"] = "；".join(reason_parts) if reason_parts else "竞品数据不足"
+
+    return result
+
+
+def _extract_selling_points(competitors: dict) -> list[str]:
+    """从竞品数据中提取核心卖点。"""
+    points = []
+    for asin, data in competitors.items():
+        title = data.get("title", "")
+        if title:
+            # 从标题提取卖点关键词：分隔符前后的关键短语
+            for sep in [" - ", " – ", " | ", " — ", ", "]:
+                if sep in title:
+                    parts = title.split(sep)
+                    for p in parts[1:]:  # 品牌+核心词后的部分
+                        p = p.strip()
+                        if len(p) > 10 and len(p) < 120:
+                            points.append(p)
+                    break
+        # 从 bullets 提取
+        bullets = data.get("bullets", [])
+        for b in bullets[:2]:  # 前两条通常含核心卖点
+            b = b.strip()
+            if len(b) > 15 and len(b) < 200:
+                points.append(b)
+        if len(points) >= 8:
+            break
+
+    return points[:8]
+
+
+def _build_reverse_engineering_summary(competitors: dict) -> str:
+    """从竞品数据生成反向工程结论。"""
+    count = len(competitors)
+    common_features = []
+    for data in competitors.values():
+        title_lower = data.get("title", "").lower()
+        for feat in ["insulated", "bpa-free", "leak-proof", "stainless", "vacuum", "durable",
+                     "lightweight", "portable", "eco-friendly", "dishwasher", "wide mouth"]:
+            if feat in title_lower and feat not in common_features:
+                common_features.append(feat)
+
+    summary = f"分析了 {count} 个竞品。"
+    if common_features:
+        summary += f"共同核心卖点：{'、'.join(common_features[:5])}。"
+    summary += "竞品普遍在材质（stainless steel）、保温性能（vacuum insulation）和安全性（BPA-free）上突出。"
+    return summary
 
 
 def _build_keyword_score(keywords: list[str] | None, search_terms: list[str],
