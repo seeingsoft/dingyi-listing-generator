@@ -13,6 +13,7 @@ from task_state import (
     add_checkpoint,
     get_checkpoints,
     get_task,
+    get_task_tenant,
     list_tasks,
     set_status,
 )
@@ -30,6 +31,24 @@ def _get_tenant_id() -> str | None:
     return tid.strip()
 
 
+def _check_tenant_access(task_id: str, tenant_id: str) -> tuple[dict | None, tuple | None]:
+    """GATE-H L5: 检查 tenant 访问权限。
+
+    Returns:
+        (task, None) - 有权限，返回 task dict
+        (None, (404_response)) - task 不存在
+        (None, (403_response)) - task 存在但 tenant 不匹配
+    """
+    # 先查 task 是否存在（不做 tenant 校验）
+    actual_tenant = get_task_tenant(task_id)
+    if actual_tenant is None:
+        return None, (jsonify({"error": "task not found"}), 404)
+    if actual_tenant != tenant_id:
+        return None, (jsonify({"error": "forbidden: task belongs to different tenant"}), 403)
+    # 有权限，返回完整 task
+    return get_task(task_id, tenant_id=tenant_id), None
+
+
 @bp.route("/<task_id>", methods=["GET"])
 def get_task_status(task_id: str):
     """查询 task 状态。需要 X-Tenant-ID header。"""
@@ -37,10 +56,9 @@ def get_task_status(task_id: str):
     if not tenant_id:
         return jsonify({"error": "X-Tenant-ID header required"}), 401
 
-    task = get_task(task_id, tenant_id=tenant_id)
-    if not task:
-        return jsonify({"error": "task not found or tenant mismatch"}), 404
-
+    task, err = _check_tenant_access(task_id, tenant_id)
+    if err:
+        return err
     return jsonify(task)
 
 
@@ -51,10 +69,9 @@ def update_status(task_id: str):
     if not tenant_id:
         return jsonify({"error": "X-Tenant-ID header required"}), 401
 
-    # 先验证 task 存在且属于该 tenant
-    task = get_task(task_id, tenant_id=tenant_id)
-    if not task:
-        return jsonify({"error": "task not found or tenant mismatch"}), 404
+    task, err = _check_tenant_access(task_id, tenant_id)
+    if err:
+        return err
 
     body = request.get_json(silent=True) or {}
     status = body.get("status", "").strip()
@@ -77,9 +94,9 @@ def add_cp(task_id: str):
     if not tenant_id:
         return jsonify({"error": "X-Tenant-ID header required"}), 401
 
-    task = get_task(task_id, tenant_id=tenant_id)
-    if not task:
-        return jsonify({"error": "task not found or tenant mismatch"}), 404
+    task, err = _check_tenant_access(task_id, tenant_id)
+    if err:
+        return err
 
     body = request.get_json(silent=True) or {}
     phase = body.get("phase", "").strip()
@@ -98,9 +115,9 @@ def get_cps(task_id: str):
     if not tenant_id:
         return jsonify({"error": "X-Tenant-ID header required"}), 401
 
-    task = get_task(task_id, tenant_id=tenant_id)
-    if not task:
-        return jsonify({"error": "task not found or tenant mismatch"}), 404
+    task, err = _check_tenant_access(task_id, tenant_id)
+    if err:
+        return err
 
     cps = get_checkpoints(task_id)
     return jsonify({"task_id": task_id, "checkpoints": cps, "total": len(cps)})
@@ -113,9 +130,9 @@ def get_receipt(task_id: str):
     if not tenant_id:
         return jsonify({"error": "X-Tenant-ID header required"}), 401
 
-    task = get_task(task_id, tenant_id=tenant_id)
-    if not task:
-        return jsonify({"error": "task not found or tenant mismatch"}), 404
+    task, err = _check_tenant_access(task_id, tenant_id)
+    if err:
+        return err
 
     cps = get_checkpoints(task_id)
 

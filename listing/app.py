@@ -373,6 +373,36 @@ def generate_report_endpoint():
     return jsonify({"success": True, "report": report, "report_html": report_html})
 
 
+def _extract_tenant_from_jwt() -> str | None:
+    """GATE-H L5: 从 Authorization Bearer JWT 中提取 tenant_id。
+
+    JWT 中的 tenant_id 是 PCE auth 中间件已验证的，优先于裸 X-Tenant-ID header。
+    无 JWT 或解码失败时返回 None。
+    """
+    import base64
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:].strip()
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        # JWT payload 是第 2 段，base64url 解码
+        payload_b64 = parts[1]
+        # 补齐 base64 padding
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+        payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+        import json as _json
+        claims = _json.loads(payload_json)
+        tid = claims.get("tenant_id", "")
+        return tid.strip() if tid else None
+    except Exception:
+        return None
+
+
 @app.route("/api/v1/listing/generate/react", methods=["POST"])
 def generate_react():
     """通过 ReAct Agent 生成 Listing，接入 PCE Task 状态机。
@@ -408,13 +438,20 @@ def generate_react():
     if not isinstance(competitor_asins, list):
         competitor_asins = [competitor_asins] if competitor_asins else []
 
-    # 1. R112-RECOVERY: 请求级 tenant_id（从 X-Tenant-ID header 提取，非进程级 env）
-    tenant_id = request.headers.get("X-Tenant-ID", "").strip()
-    if not tenant_id:
-        raise APIError("X-Tenant-ID header required", code=401)
+    # 1. GATE-H L5: tenant_id 从 PCE 已验证 JWT 提取，不信任裸 X-Tenant-ID header
+    #    JWT 中的 tenant_id 是 PCE auth 中间件已验证的，X-Tenant-ID 仅作辅助
+    raw_header_tenant = request.headers.get("X-Tenant-ID", "").strip()
+    jwt_tenant = _extract_tenant_from_jwt()
+    if jwt_tenant:
+        tenant_id = jwt_tenant  # 优先使用 JWT 中的 tenant_id（已验证）
+    elif raw_header_tenant:
+        # 无 JWT 时拒绝 -- GATE-H: 不信任裸 Header tenant
+        raise APIError("Valid JWT with tenant_id required (bare X-Tenant-ID not trusted)", code=401)
+    else:
+        raise APIError("X-Tenant-ID header or JWT token required", code=401)
 
-    # 2. 生成幂等键（R88: 纳入 tenant_id + competitor_asins + async/sync mode + schema_version）
-    schema_version = "v2.5.0"
+    # 2. GATE-H L2: 幂等键查找 -- 重复请求返回原 task_id（不生成新幂等键）
+    schema_version = "v2.5.1"
     async_label = "async" if async_mode else "sync"
     asins_str = ",".join(sorted(competitor_asins)) if competitor_asins else ""
     id_key_raw = (
@@ -426,10 +463,24 @@ def generate_react():
     )
     idempotency_key = hashlib.sha256(id_key_raw.encode()).hexdigest()[:32]
 
-    # 3. 生成本地 task_id（R112-RECOVERY: Listing 侧自维护状态机）
+    # 幂等查找：如果 (tenant_id, idempotency_key) 已存在，直接返回原 task_id
+    from task_state import lookup_idempotent, register_idempotent
+    existing_task_id = lookup_idempotent(tenant_id, idempotency_key)
+    if existing_task_id:
+        logger.info(f"[gate-h] Idempotent hit, returning existing task_id: {existing_task_id}")
+        return jsonify({
+            "task_id": existing_task_id,
+            "accepted": True,
+            "mode": "react",
+            "idempotent": True,
+            "status_url": f"/api/v1/tasks/{existing_task_id}",
+            "receipt_url": f"/api/v1/tasks/{existing_task_id}/receipt",
+        })
+
+    # 3. 生成本地 task_id
     local_task_id = gen_task_id()
 
-    # 4. 创建 PCE Task（带 JWT 认证和幂等键，best-effort）
+    # 4. GATE-H P8: 创建 PCE Task -- 失败/超时 -> accepted=false（不降级受理）
     pce_task_id = create_task(
         task_type="listing_generation",
         payload={
@@ -443,9 +494,16 @@ def generate_react():
         tenant_id=tenant_id,
     )
 
-    # PCE 不可用时，仍可在 Listing 侧本地调度（R112-RECOVERY: 不回退到无限 daemon）
-    # 但如果连本地 dispatcher 也入队失败，返回 accepted=false
-    use_local_dispatch = True
+    # GATE-H P8: PCE 不可用 -> accepted=false，不降级本地受理
+    if not pce_task_id:
+        return jsonify({
+            "accepted": False,
+            "error": "pce_unavailable",
+            "detail": "PCE CreateTask failed or timed out - request rejected (no local fallback)",
+        })
+
+    # 注册幂等映射（PCE 成功后才注册）
+    register_idempotent(tenant_id, idempotency_key, local_task_id)
 
     # 5. 异步模式：真实 dispatcher 入队 -> worker 消费 -> 实际执行
     if async_mode:

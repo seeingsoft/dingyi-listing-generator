@@ -1,11 +1,11 @@
 {
   "schema": "dingyi-current/v1",
-  "updated": "2026-07-16T16:40:00+08:00",
+  "updated": "2026-07-16T18:45:00+08:00",
   "worker": "listing",
   "round": 112,
-  "state": "R112_RECOVERY_GATE_D2_DONE",
-  "next_round": "R113_OR_CODEX_C1_REVERIFY",
-  "blocking": "PCE_LISTING_GENERATION_TAG_NO_CONFIG",
+  "state": "R112_RECOVERY_PHASE2_GATE_H",
+  "next_round": "R112-RECOVERY-GATE-H",
+  "blocking": "GATE_E_FAIL",
   "last_push": "2c6912e",
   "py_compile": "PASS",
   "external_llm": 0,
@@ -18,7 +18,7 @@
   "receipt": true,
   "tenant_request_level": true,
   "sync_final_state": "LOCAL_STATE_MACHINE_WORKING (PCE tag 404 is infra issue)",
-  "active_sequence": "R112-RECOVERY",
+  "active_sequence": "R112-RECOVERY-PHASE2",
   "recovery_gates": {
     "GATE_D2": "DONE"
   },

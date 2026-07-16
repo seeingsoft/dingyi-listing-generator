@@ -61,6 +61,16 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_cp_task ON task_checkpoints(task_id);
             CREATE INDEX IF NOT EXISTS idx_state_tenant ON task_states(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_state_status ON task_states(status);
+
+            -- GATE-H L2: 幂等映射表 (tenant_id, idempotency_key) -> task_id
+            CREATE TABLE IF NOT EXISTS idempotency_map (
+                tenant_id       TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                task_id         TEXT NOT NULL,
+                created_at      REAL NOT NULL,
+                PRIMARY KEY (tenant_id, idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_idem_task ON idempotency_map(task_id);
             """
         )
         conn.commit()
@@ -236,3 +246,64 @@ def list_tasks(
 def gen_task_id() -> str:
     """生成唯一 task_id。"""
     return f"lst-{uuid.uuid4().hex[:16]}-{int(time.time())}"
+
+
+# === GATE-H L2: 幂等映射 ===
+
+def lookup_idempotent(
+    tenant_id: str,
+    idempotency_key: str,
+) -> str | None:
+    """查找已有 task_id（幂等）。如果 (tenant_id, idempotency_key) 已存在，返回原 task_id。
+
+    Returns:
+        str | None: 已存在的 task_id，或 None（首次请求）
+    """
+    if not tenant_id or not idempotency_key:
+        return None
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT task_id FROM idempotency_map WHERE tenant_id = ? AND idempotency_key = ?",
+            (tenant_id, idempotency_key),
+        ).fetchone()
+    if row:
+        logger.info(f"[task-state] Idempotent hit: {row['task_id']} (tenant={tenant_id})")
+        return row["task_id"]
+    return None
+
+
+def register_idempotent(
+    tenant_id: str,
+    idempotency_key: str,
+    task_id: str,
+) -> bool:
+    """注册幂等映射。如果已存在则返回 False（不应覆盖）。
+
+    Returns:
+        bool: 注册成功 True，已存在 False
+    """
+    if not tenant_id or not idempotency_key:
+        return True
+    now = time.time()
+    with _lock, _get_conn() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO idempotency_map (tenant_id, idempotency_key, task_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (tenant_id, idempotency_key, task_id, now),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            logger.info(f"[task-state] Idempotent already registered: tenant={tenant_id} key={idempotency_key[:16]}")
+            return False
+
+
+def get_task_tenant(task_id: str) -> str | None:
+    """查询 task 的 tenant_id（不做租户校验，用于判断 403 vs 404）。"""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT tenant_id FROM task_states WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    return row["tenant_id"] if row else None
