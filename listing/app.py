@@ -32,14 +32,22 @@ from image_extractor import extract_from_image
 from publisher import format_for_platforms, list_platforms
 from variant_generator import generate_variants
 from evidence_collector import _fetch_parallel_evidence, build_evidence_graph
-from pce_task_client import create_task
+from pce_task_client import create_task, update_task_status, task_checkpoint
 from quality_reviewer import pro_review
 import hashlib
+
+# R112-RECOVERY-GATE-D2: 真实 dispatcher + 请求级 tenant + status 端点
+from task_state import init_db as task_init_db, gen_task_id, get_task, get_checkpoints
+from dispatcher import enqueue as dispatch_enqueue, get_active_count
+from status_endpoint import bp as task_status_bp
 
 # === Flask 初始化 ===
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 app.config["JSON_SORT_KEYS"] = False
+
+# 注册 task status/checkpoint/receipt 端点
+app.register_blueprint(task_status_bp)
 
 # === 日志 ===
 logging.basicConfig(
@@ -48,6 +56,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("listing")
+
+# === R112-RECOVERY: 初始化本地 task 状态 DB ===
+task_init_db()
 
 
 # === 错误处理 ===
@@ -114,6 +125,9 @@ def deep_health():
                 "status": pce_status,
                 "endpoint": os.environ.get("PCE_API_BASE", "http://127.0.0.1:8180"),
                 "error": pce_error,
+            },
+            "dispatcher": {
+                "active_tasks": get_active_count(),
             },
         },
     })
@@ -394,10 +408,13 @@ def generate_react():
     if not isinstance(competitor_asins, list):
         competitor_asins = [competitor_asins] if competitor_asins else []
 
-    # 1. 生成幂等键（R88: 纳入 tenant_id + competitor_asins + async/sync mode + schema_version）
-    import os as _os
-    tenant_id = _os.environ.get("PCE_TENANT_ID", "system")
-    schema_version = "v2.3.1"
+    # 1. R112-RECOVERY: 请求级 tenant_id（从 X-Tenant-ID header 提取，非进程级 env）
+    tenant_id = request.headers.get("X-Tenant-ID", "").strip()
+    if not tenant_id:
+        raise APIError("X-Tenant-ID header required", code=401)
+
+    # 2. 生成幂等键（R88: 纳入 tenant_id + competitor_asins + async/sync mode + schema_version）
+    schema_version = "v2.5.0"
     async_label = "async" if async_mode else "sync"
     asins_str = ",".join(sorted(competitor_asins)) if competitor_asins else ""
     id_key_raw = (
@@ -409,33 +426,169 @@ def generate_react():
     )
     idempotency_key = hashlib.sha256(id_key_raw.encode()).hexdigest()[:32]
 
-    # 2. 创建 PCE Task（带 JWT 认证和幂等键）
-    task_id = create_task(
+    # 3. 生成本地 task_id（R112-RECOVERY: Listing 侧自维护状态机）
+    local_task_id = gen_task_id()
+
+    # 4. 创建 PCE Task（带 JWT 认证和幂等键，best-effort）
+    pce_task_id = create_task(
         task_type="listing_generation",
         payload={
             "product_name": product_name,
             "market": target_market,
             "mode": async_label,
             "schema_version": schema_version,
+            "local_task_id": local_task_id,
         },
         idempotency_key=idempotency_key,
+        tenant_id=tenant_id,
     )
 
-    if not task_id:
-        return jsonify({
-            "accepted": False,
-            "error": "PCE CreateTask failed: PCE 不可用或创建 Task 失败",
-        })
+    # PCE 不可用时，仍可在 Listing 侧本地调度（R112-RECOVERY: 不回退到无限 daemon）
+    # 但如果连本地 dispatcher 也入队失败，返回 accepted=false
+    use_local_dispatch = True
 
-    # 3. 异步模式：由 PCE Task 状态机调度，不启用 Python 后台线程
+    # 5. 异步模式：真实 dispatcher 入队 -> worker 消费 -> 实际执行
     if async_mode:
+        from task_state import create_local_task, set_status as _set_status
+        from task_state import add_checkpoint as _add_cp
+
+        # 创建本地 task 记录
+        create_local_task(local_task_id, tenant_id, {
+            "product_name": product_name,
+            "category": category,
+            "keywords": keywords,
+            "selling_points": selling_points,
+            "target_market": target_market,
+            "language": language,
+            "competitor_asins": competitor_asins,
+            "pce_task_id": pce_task_id,
+        })
+        _add_cp(local_task_id, "task_created", {"pce_task_id": pce_task_id})
+
+        # 定义 worker 执行函数
+        def _async_work(payload: dict) -> dict:
+            """真实 worker 执行体：运行 ReAct 流水线 + 合规 + 证据 + 评审。"""
+            _add_cp(local_task_id, "react_start")
+
+            result = generate_via_react(
+                product_name=payload["product_name"],
+                category=payload["category"],
+                keywords=payload["keywords"],
+                selling_points=payload["selling_points"],
+                target_market=payload["target_market"],
+                language=payload["language"],
+                competitor_asins=payload["competitor_asins"],
+            )
+            _add_cp(local_task_id, "react_done", {"title": result.get("title", "")[:50]})
+
+            compliance = check_compliance(
+                title=result.get("title", ""),
+                bullets=result.get("bullets", []),
+                description=result.get("description", ""),
+                product_name=payload["product_name"],
+            )
+            brand_violations_list = check_brand_filter(
+                title=result.get("title", ""),
+                bullets=result.get("bullets", []),
+                description=result.get("description", ""),
+            )
+            all_violations = compliance.violations + brand_violations_list
+            has_prohibited = any(v["type"] == "prohibited" for v in all_violations)
+            compliance_score = get_quality_score(all_violations)
+            final_quality = 0 if has_prohibited else min(90, compliance_score)
+            _add_cp(local_task_id, "compliance_done", {"quality": final_quality})
+
+            try:
+                ev_claims = _fetch_parallel_evidence(
+                    asins=payload["competitor_asins"] if payload["competitor_asins"] else None,
+                    keywords=result.get("search_terms"),
+                    market=payload["target_market"],
+                )
+                ev_graph = build_evidence_graph(ev_claims)
+            except Exception:
+                ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
+            _add_cp(local_task_id, "evidence_done", {"claims": ev_graph.get("total_claims", 0)})
+
+            pro_review_result = None
+            try:
+                pro_review_result = pro_review(
+                    listing=result,
+                    product_name=payload["product_name"],
+                    category=payload["category"],
+                    target_market=payload["target_market"],
+                    language=payload["language"],
+                    flash_quality_score=final_quality,
+                )
+            except Exception as e:
+                logger.warning(f"Pro review skipped (degraded): {e}")
+            _add_cp(local_task_id, "review_done")
+
+            # best-effort 更新 PCE task 终态
+            if pce_task_id:
+                update_task_status(pce_task_id, "completed", detail={
+                    "local_task_id": local_task_id,
+                    "quality": final_quality,
+                })
+
+            return {
+                "title": result.get("title", ""),
+                "bullets": result.get("bullets", []),
+                "description": result.get("description", ""),
+                "search_terms": result.get("search_terms", []),
+                "compliance": {
+                    "passed": compliance.passed and len(brand_violations_list) == 0,
+                    "violations": all_violations,
+                    "quality_score": final_quality,
+                    "brand_violations": len(brand_violations_list),
+                },
+                "evidence_graph": ev_graph,
+                "pro_review": pro_review_result,
+            }
+
+        # 入队真实 dispatcher
+        ok = dispatch_enqueue(local_task_id, tenant_id, {
+            "product_name": product_name,
+            "category": category,
+            "keywords": keywords,
+            "selling_points": selling_points,
+            "target_market": target_market,
+            "language": language,
+            "competitor_asins": competitor_asins,
+        }, _async_work)
+
+        if not ok:
+            return jsonify({
+                "accepted": False,
+                "error": "dispatcher enqueue failed",
+                "task_id": local_task_id,
+            })
+
         return jsonify({
-            "task_id": task_id,
+            "task_id": local_task_id,
+            "pce_task_id": pce_task_id,
             "accepted": True,
             "mode": "react",
+            "status_url": f"/api/v1/tasks/{local_task_id}",
+            "receipt_url": f"/api/v1/tasks/{local_task_id}/receipt",
         })
 
-    # 4. 同步模式：直接执行流水线
+    # 6. 同步模式：直接执行流水线
+    from task_state import create_local_task, set_status as _set_status
+    from task_state import add_checkpoint as _add_cp
+
+    create_local_task(local_task_id, tenant_id, {
+        "product_name": product_name,
+        "category": category,
+        "keywords": keywords,
+        "selling_points": selling_points,
+        "target_market": target_market,
+        "language": language,
+        "competitor_asins": competitor_asins,
+        "pce_task_id": pce_task_id,
+    })
+    _set_status(local_task_id, "running")
+    _add_cp(local_task_id, "sync_react_start")
+
     try:
         result = generate_via_react(
             product_name=product_name,
@@ -448,7 +601,12 @@ def generate_react():
         )
     except Exception as e:
         logger.error(f"ReAct agent failed: {traceback.format_exc()}")
+        _set_status(local_task_id, "failed", error=str(e))
+        if pce_task_id:
+            update_task_status(pce_task_id, "failed", detail={"error": str(e)})
         raise APIError(f"ReAct agent failed: {e}", code=502)
+
+    _add_cp(local_task_id, "sync_react_done", {"title": result.get("title", "")[:50]})
 
     # 合规检查 + 品牌过滤
     compliance = check_compliance(
@@ -466,6 +624,7 @@ def generate_react():
     has_prohibited = any(v["type"] == "prohibited" for v in all_violations)
     compliance_score = get_quality_score(all_violations)
     final_quality = 0 if has_prohibited else min(90, compliance_score)
+    _add_cp(local_task_id, "sync_compliance_done", {"quality": final_quality})
 
     # 证据图（非阻塞，失败不中断主流程）
     try:
@@ -477,6 +636,7 @@ def generate_react():
         ev_graph = build_evidence_graph(ev_claims)
     except Exception:
         ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
+    _add_cp(local_task_id, "sync_evidence_done", {"claims": ev_graph.get("total_claims", 0)})
 
     # Pro 独立评审（非阻塞，失败不中断主流程）
     pro_review_result = None
@@ -491,6 +651,32 @@ def generate_react():
         )
     except Exception as e:
         logger.warning(f"Pro review skipped (degraded): {e}")
+    _add_cp(local_task_id, "sync_review_done")
+
+    # 标记 sync task 完成
+    sync_result = {
+        "title": result.get("title", ""),
+        "bullets": result.get("bullets", []),
+        "description": result.get("description", ""),
+        "search_terms": result.get("search_terms", []),
+        "compliance": {
+            "passed": compliance.passed and len(brand_violations_list) == 0,
+            "violations": all_violations,
+            "quality_score": final_quality,
+            "brand_violations": len(brand_violations_list),
+        },
+        "evidence_graph": ev_graph,
+        "pro_review": pro_review_result,
+    }
+    _set_status(local_task_id, "completed", result=sync_result)
+    _add_cp(local_task_id, "sync_task_finalized")
+
+    # best-effort 更新 PCE task 终态
+    if pce_task_id:
+        update_task_status(pce_task_id, "completed", detail={
+            "local_task_id": local_task_id,
+            "quality": final_quality,
+        })
 
     return jsonify({
         "success": True,
@@ -507,9 +693,12 @@ def generate_react():
             "brand_violations": len(brand_violations_list),
         },
         "mode": "react",
-        "task_id": task_id,
+        "task_id": local_task_id,
+        "pce_task_id": pce_task_id,
         "evidence_graph": ev_graph,
         "pro_review": pro_review_result,
+        "status_url": f"/api/v1/tasks/{local_task_id}",
+        "receipt_url": f"/api/v1/tasks/{local_task_id}/receipt",
     })
 
 
