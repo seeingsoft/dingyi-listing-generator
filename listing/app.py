@@ -31,6 +31,10 @@ from compliance_api import check_compliance_full
 from image_extractor import extract_from_image
 from publisher import format_for_platforms, list_platforms
 from variant_generator import generate_variants
+from evidence_collector import _fetch_parallel_evidence, build_evidence_graph
+from pce_task_client import create_task
+from quality_reviewer import pro_review
+import hashlib
 
 # === Flask 初始化 ===
 app = Flask(__name__)
@@ -357,22 +361,28 @@ def generate_report_endpoint():
 
 @app.route("/api/v1/listing/generate/react", methods=["POST"])
 def generate_react():
-    """通过 ReAct 多工具 Agent 生成 Listing。
+    """通过 ReAct Agent 生成 Listing，接入 PCE Task 状态机。
 
     Request Body: 同 /api/v1/listing/generate，额外支持:
         "competitor_asins": [...],  # 可选，自动通过 ISR 分析竞品
+        "async": true,               # 可选，异步模式 → {task_id, accepted}
+
+    Response (sync): 完整 listing + compliance + evidence_graph + pro_review + task_id
+    Response (async): {"task_id": "...", "accepted": true, "mode": "react"}
+    Response (PCE 不可用): {"accepted": false, "error": "PCE CreateTask failed: ..."}
     """
     body = request.get_json(silent=True)
     if not body:
         raise APIError("Request body is required", code=400)
 
-    product_name = body.get("product_name", "")
-    category = body.get("category", "")
+    product_name = body.get("product_name", "").strip()
+    category = body.get("category", "").strip()
     keywords = body.get("keywords", [])
     selling_points = body.get("selling_points", [])
-    target_market = body.get("target_market", "US")
-    language = body.get("language", "en")
+    target_market = body.get("target_market", "US").strip()
+    language = body.get("language", "en").strip()
     competitor_asins = body.get("competitor_asins", [])
+    async_mode = bool(body.get("async", False))
 
     if not product_name:
         raise APIError("product_name is required", code=400)
@@ -384,6 +394,48 @@ def generate_react():
     if not isinstance(competitor_asins, list):
         competitor_asins = [competitor_asins] if competitor_asins else []
 
+    # 1. 生成幂等键（R88: 纳入 tenant_id + competitor_asins + async/sync mode + schema_version）
+    import os as _os
+    tenant_id = _os.environ.get("PCE_TENANT_ID", "system")
+    schema_version = "v2.3.1"
+    async_label = "async" if async_mode else "sync"
+    asins_str = ",".join(sorted(competitor_asins)) if competitor_asins else ""
+    id_key_raw = (
+        f"{tenant_id}:::{schema_version}:::{async_label}:::"
+        f"{product_name}:::{category}:::"
+        f"{','.join(sorted(keywords))}:::"
+        f"{','.join(sorted(selling_points))}:::"
+        f"{asins_str}:::{target_market}:::{language}"
+    )
+    idempotency_key = hashlib.sha256(id_key_raw.encode()).hexdigest()[:32]
+
+    # 2. 创建 PCE Task（带 JWT 认证和幂等键）
+    task_id = create_task(
+        task_type="listing_generation",
+        payload={
+            "product_name": product_name,
+            "market": target_market,
+            "mode": async_label,
+            "schema_version": schema_version,
+        },
+        idempotency_key=idempotency_key,
+    )
+
+    if not task_id:
+        return jsonify({
+            "accepted": False,
+            "error": "PCE CreateTask failed: PCE 不可用或创建 Task 失败",
+        })
+
+    # 3. 异步模式：由 PCE Task 状态机调度，不启用 Python 后台线程
+    if async_mode:
+        return jsonify({
+            "task_id": task_id,
+            "accepted": True,
+            "mode": "react",
+        })
+
+    # 4. 同步模式：直接执行流水线
     try:
         result = generate_via_react(
             product_name=product_name,
@@ -415,6 +467,31 @@ def generate_react():
     compliance_score = get_quality_score(all_violations)
     final_quality = 0 if has_prohibited else min(90, compliance_score)
 
+    # 证据图（非阻塞，失败不中断主流程）
+    try:
+        ev_claims = _fetch_parallel_evidence(
+            asins=competitor_asins if competitor_asins else None,
+            keywords=result.get("search_terms"),
+            market=target_market,
+        )
+        ev_graph = build_evidence_graph(ev_claims)
+    except Exception:
+        ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
+
+    # Pro 独立评审（非阻塞，失败不中断主流程）
+    pro_review_result = None
+    try:
+        pro_review_result = pro_review(
+            listing=result,
+            product_name=product_name,
+            category=category,
+            target_market=target_market,
+            language=language,
+            flash_quality_score=final_quality,
+        )
+    except Exception as e:
+        logger.warning(f"Pro review skipped (degraded): {e}")
+
     return jsonify({
         "success": True,
         "data": {
@@ -430,7 +507,53 @@ def generate_react():
             "brand_violations": len(brand_violations_list),
         },
         "mode": "react",
+        "task_id": task_id,
+        "evidence_graph": ev_graph,
+        "pro_review": pro_review_result,
     })
+
+
+@app.route("/api/v1/listing/review", methods=["POST"])
+def review_listing():
+    """Pro 独立质量评审端点。
+
+    对已有 listing 文案进行 Pro 模型独立评审，输出质量分与 Flash 对比。
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        raise APIError("Request body is required", code=400)
+
+    title = body.get("title", "")
+    bullets = body.get("bullets", [])
+    description = body.get("description", "")
+
+    if not title and not bullets and not description:
+        raise APIError("title / bullets / description 至少提供一个", code=400)
+
+    if not isinstance(bullets, list):
+        bullets = [bullets]
+
+    listing = {
+        "title": title,
+        "bullets": bullets,
+        "description": description,
+        "search_terms": body.get("search_terms", []),
+    }
+
+    try:
+        review = pro_review(
+            listing=listing,
+            product_name=body.get("product_name", ""),
+            category=body.get("category", ""),
+            target_market=body.get("target_market", "US"),
+            language=body.get("language", "en"),
+            flash_quality_score=body.get("flash_quality_score"),
+        )
+    except Exception as e:
+        logger.error(f"Pro review failed: {traceback.format_exc()}")
+        raise APIError(f"Pro review failed: {e}", code=502)
+
+    return jsonify({"success": True, "review": review})
 
 
 @app.route("/api/v1/listing/compliance", methods=["POST"])
