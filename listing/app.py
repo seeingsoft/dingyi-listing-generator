@@ -599,8 +599,9 @@ def generate_react():
                     asins=payload["competitor_asins"] if payload["competitor_asins"] else None,
                     keywords=result.get("search_terms"),
                     market=payload["target_market"],
+                    tenant_id=tenant_id,
                 )
-                ev_graph = build_evidence_graph(ev_claims)
+                ev_graph = build_evidence_graph(ev_claims, tenant_id=tenant_id)
             except Exception:
                 ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
             _add_cp(local_task_id, "evidence_done", {"claims": ev_graph.get("total_claims", 0)})
@@ -728,8 +729,9 @@ def generate_react():
             asins=competitor_asins if competitor_asins else None,
             keywords=result.get("search_terms"),
             market=target_market,
+            tenant_id=tenant_id,
         )
-        ev_graph = build_evidence_graph(ev_claims)
+        ev_graph = build_evidence_graph(ev_claims, tenant_id=tenant_id)
     except Exception:
         ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
     _add_cp(local_task_id, "sync_evidence_done", {"claims": ev_graph.get("total_claims", 0)})

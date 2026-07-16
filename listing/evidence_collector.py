@@ -59,8 +59,11 @@ def _fetch_parallel_evidence(
     asins: list[str] | None = None,
     keywords: list[str] | None = None,
     market: str = "US",
+    tenant_id: str | None = None,
 ) -> list[dict]:
     """五路并行证据采集。
+
+    R119: tenant_id 参数，传播到 ISR API 调用。
 
     当前实现：
     - ISR competitor-detail-batch（竞品数据）
@@ -75,9 +78,10 @@ def _fetch_parallel_evidence(
         asins: 竞品 ASIN 列表
         keywords: 产品关键词列表
         market: 目标市场
+        tenant_id: 租户 ID（R119，传播到 ISR）
 
     Returns:
-        List[dict]: EvidenceClaim.to_dict() 列表
+        List[dict]: EvidenceClaim.to_dict() 列表，含 tenant_id
     """
     claims: list[EvidenceClaim] = []
     subtasks: list[dict] = []
@@ -87,12 +91,12 @@ def _fetch_parallel_evidence(
         subtasks.append({
             "name": "competitor-detail-batch",
             "func": _fetch_competitor_detail,
-            "args": (asins, market),
+            "args": (asins, market, tenant_id),
         })
         subtasks.append({
             "name": "keyword-value",
             "func": _fetch_keyword_value,
-            "args": (asins, market),
+            "args": (asins, market, tenant_id),
         })
 
     if not subtasks:
@@ -133,11 +137,18 @@ def _fetch_parallel_evidence(
     return [ec.to_dict() for ec in claims]
 
 
-def _fetch_competitor_detail(asins: list[str], market: str) -> list[EvidenceClaim]:
-    """调用 ISR competitor-detail-batch 获取竞品证据。"""
+def _fetch_competitor_detail(asins: list[str], market: str, tenant_id: str | None = None) -> list[EvidenceClaim]:
+    """调用 ISR competitor-detail-batch 获取竞品证据。
+
+    R119: tenant_id 传播到 ISR。
+    """
+    headers = {}
+    if tenant_id:
+        headers["X-Tenant-ID"] = tenant_id
     resp = requests.post(
         f"{ISR_BASE}/search/competitor-detail-batch",
         json={"asins": asins},
+        headers=headers or None,
         timeout=SUBTASK_TIMEOUT,
     )
     if not resp.ok:
@@ -188,11 +199,18 @@ def _fetch_competitor_detail(asins: list[str], market: str) -> list[EvidenceClai
     return claims
 
 
-def _fetch_keyword_value(asins: list[str], market: str) -> list[EvidenceClaim]:
-    """调用 ISR keyword-value 获取关键词证据。"""
+def _fetch_keyword_value(asins: list[str], market: str, tenant_id: str | None = None) -> list[EvidenceClaim]:
+    """调用 ISR keyword-value 获取关键词证据。
+
+    R119: tenant_id 传播到 ISR。
+    """
+    headers = {}
+    if tenant_id:
+        headers["X-Tenant-ID"] = tenant_id
     resp = requests.post(
         f"{ISR_BASE}/search/keyword-value",
         json={"asins": asins},
+        headers=headers or None,
         timeout=SUBTASK_TIMEOUT,
     )
     if not resp.ok:
@@ -226,11 +244,15 @@ def _fetch_keyword_value(asins: list[str], market: str) -> list[EvidenceClaim]:
 
 def build_evidence_graph(
     claims: list[dict],
+    tenant_id: str | None = None,
 ) -> dict:
     """从 claims 列表构建 evidence_graph 结构。
 
+    R119: tenant_id 参数写入输出。
+
     Args:
         claims: _fetch_parallel_evidence() 返回值
+        tenant_id: 租户 ID（写入输出）
 
     Returns:
         dict: {
@@ -238,6 +260,7 @@ def build_evidence_graph(
             "sources": list[str],
             "claims": list[dict],
             "data_insufficient": bool,
+            "tenant_id": str | None,
         }
     """
     if not claims:
@@ -246,6 +269,7 @@ def build_evidence_graph(
             "sources": [],
             "claims": [],
             "data_insufficient": True,
+            "tenant_id": tenant_id,
         }
 
     sources = list(set(c.get("source_type", "unknown") for c in claims))
@@ -257,4 +281,5 @@ def build_evidence_graph(
         "sources": sorted(sources),
         "claims": valid_claims,
         "data_insufficient": len(valid_claims) < 3,
+        "tenant_id": tenant_id,
     }
