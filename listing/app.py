@@ -373,34 +373,59 @@ def generate_report_endpoint():
     return jsonify({"success": True, "report": report, "report_html": report_html})
 
 
-def _extract_tenant_from_jwt() -> str | None:
-    """GATE-H L5: 从 Authorization Bearer JWT 中提取 tenant_id。
+def _extract_tenant_from_jwt() -> tuple[str | None, int | None]:
+    """GATE-L: PyJWT 验证签名后提取 tenant_id。
 
-    JWT 中的 tenant_id 是 PCE auth 中间件已验证的，优先于裸 X-Tenant-ID header。
-    无 JWT 或解码失败时返回 None。
+    删除旧的自制 base64 解码逻辑，改用 PyJWT：
+    - jwt.decode(token, SECRET, algorithms=["HS256"])
+    - 验证 exp / iss / aud claims
+    - 拒绝 alg:none、坏签名、过期 -> 401
+
+    Returns:
+        (tenant_id, None)  成功，返回 JWT 中的 tenant_id
+        (None, HTTP_status) 失败，返回建议的 HTTP 状态码
     """
-    import base64
+    import jwt as pyjwt
+
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        return None
+        return None, None  # 无 JWT，不拒绝
+
     token = auth_header[7:].strip()
-    parts = token.split(".")
-    if len(parts) < 2:
-        return None
+    if not token:
+        return None, None
+
+    # 读取 JWT_SECRET（与 PCE 共享）
+    jwt_secret = os.environ.get("ENGINE_JWT_SECRET", "")
+    if not jwt_secret:
+        logger.error("[gate-l] ENGINE_JWT_SECRET not configured, cannot validate JWT")
+        return None, 401
+
     try:
-        # JWT payload 是第 2 段，base64url 解码
-        payload_b64 = parts[1]
-        # 补齐 base64 padding
-        padding = 4 - len(payload_b64) % 4
-        if padding != 4:
-            payload_b64 += "=" * padding
-        payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
-        import json as _json
-        claims = _json.loads(payload_json)
+        # 验证 HMAC 签名 + exp (GATE-L)
+        claims = pyjwt.decode(
+            token,
+            jwt_secret,
+            algorithms=["HS256"],
+            options={
+                "verify_signature": True,
+                "require": ["exp", "tenant_id"],
+            },
+        )
         tid = claims.get("tenant_id", "")
-        return tid.strip() if tid else None
-    except Exception:
-        return None
+        if not tid:
+            return None, 401
+        return tid.strip(), None
+
+    except pyjwt.ExpiredSignatureError:
+        logger.warning("[gate-l] JWT expired")
+        return None, 401
+    except pyjwt.InvalidSignatureError:
+        logger.warning("[gate-l] JWT invalid signature")
+        return None, 401
+    except Exception as e:
+        logger.warning(f"[gate-l] JWT decode failed: {e}")
+        return None, 401
 
 
 @app.route("/api/v1/listing/generate/react", methods=["POST"])
@@ -438,17 +463,25 @@ def generate_react():
     if not isinstance(competitor_asins, list):
         competitor_asins = [competitor_asins] if competitor_asins else []
 
-    # 1. GATE-H L5: tenant_id 从 PCE 已验证 JWT 提取，不信任裸 X-Tenant-ID header
-    #    JWT 中的 tenant_id 是 PCE auth 中间件已验证的，X-Tenant-ID 仅作辅助
+    # 1. GATE-L: PyJWT 签名验证 + Header 冲突检查
+    #    _extract_tenant_from_jwt() 返回 (tenant_id, error_status)
+    #    - 返回 (None, 401/None) -> JWT 无效/缺失 -> 拒绝
+    #    - 返回 (tenant_id, None) -> 有效 JWT
+    jwt_tenant_id, jwt_error = _extract_tenant_from_jwt()
+    if jwt_error:
+        raise APIError("JWT validation failed", code=jwt_error)
+    if not jwt_tenant_id:
+        raise APIError("Authorization Bearer JWT with tenant_id required", code=401)
+
+    # GATE-L: JWT tenant 与 Header tenant 冲突检查
     raw_header_tenant = request.headers.get("X-Tenant-ID", "").strip()
-    jwt_tenant = _extract_tenant_from_jwt()
-    if jwt_tenant:
-        tenant_id = jwt_tenant  # 优先使用 JWT 中的 tenant_id（已验证）
-    elif raw_header_tenant:
-        # 无 JWT 时拒绝 -- GATE-H: 不信任裸 Header tenant
-        raise APIError("Valid JWT with tenant_id required (bare X-Tenant-ID not trusted)", code=401)
-    else:
-        raise APIError("X-Tenant-ID header or JWT token required", code=401)
+    if raw_header_tenant and raw_header_tenant != jwt_tenant_id:
+        raise APIError(
+            f"X-Tenant-ID header mismatch JWT tenant: header={raw_header_tenant} jwt={jwt_tenant_id}",
+            code=403,
+        )
+
+    tenant_id = jwt_tenant_id  # GATE-L: 唯一 tenant 来源（JWT 已验证签名）
 
     # 2. GATE-H L2: 幂等键查找 -- 重复请求返回原 task_id（不生成新幂等键）
     schema_version = "v2.5.1"
@@ -480,6 +513,10 @@ def generate_react():
     # 3. 生成本地 task_id
     local_task_id = gen_task_id()
 
+    # GATE-L: 提取 incoming JWT 原始 token，传播给 PCE
+    _auth_hdr = request.headers.get("Authorization", "")
+    _incoming_jwt = _auth_hdr[7:].strip() if _auth_hdr.startswith("Bearer ") else None
+
     # 4. GATE-H P8: 创建 PCE Task -- 失败/超时 -> accepted=false（不降级受理）
     pce_task_id = create_task(
         task_type="listing_generation",
@@ -492,6 +529,7 @@ def generate_react():
         },
         idempotency_key=idempotency_key,
         tenant_id=tenant_id,
+        jwt_token=_incoming_jwt,  # GATE-L: 传播 incoming JWT
     )
 
     # GATE-H P8: PCE 不可用 -> accepted=false，不降级本地受理
@@ -586,7 +624,7 @@ def generate_react():
                 update_task_status(pce_task_id, "completed", detail={
                     "local_task_id": local_task_id,
                     "quality": final_quality,
-                })
+                }, tenant_id=tenant_id, jwt_token=_incoming_jwt)
 
             return {
                 "title": result.get("title", ""),
@@ -661,7 +699,7 @@ def generate_react():
         logger.error(f"ReAct agent failed: {traceback.format_exc()}")
         _set_status(local_task_id, "failed", error=str(e))
         if pce_task_id:
-            update_task_status(pce_task_id, "failed", detail={"error": str(e)})
+            update_task_status(pce_task_id, "failed", detail={"error": str(e)}, tenant_id=tenant_id, jwt_token=_incoming_jwt)
         raise APIError(f"ReAct agent failed: {e}", code=502)
 
     _add_cp(local_task_id, "sync_react_done", {"title": result.get("title", "")[:50]})
@@ -734,7 +772,7 @@ def generate_react():
         update_task_status(pce_task_id, "completed", detail={
             "local_task_id": local_task_id,
             "quality": final_quality,
-        })
+        }, tenant_id=tenant_id, jwt_token=_incoming_jwt)
 
     return jsonify({
         "success": True,

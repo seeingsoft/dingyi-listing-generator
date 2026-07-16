@@ -28,19 +28,20 @@ TASK_TIMEOUT = int(os.environ.get("PCE_TASK_TIMEOUT", "10"))
 PCE_JWT_TOKEN = os.environ.get("PCE_JWT_TOKEN", "")
 
 
-def _build_headers(tenant_id: str | None = None) -> dict:
+def _build_headers(tenant_id: str | None = None, jwt_token: str | None = None) -> dict:
     """构建包含 JWT 认证和请求级租户标识的请求头。
 
     R112-RECOVERY: tenant_id 由调用方传入（请求级），非进程级环境变量。
-    无 JWT token 时跳过 Authorization header（降级模式）。
+    GATE-L: jwt_token 从 incoming request 传播，非静态 service token。
     """
     headers = {
         "Content-Type": "application/json",
     }
     if tenant_id:
         headers["X-Tenant-ID"] = tenant_id
-    if PCE_JWT_TOKEN:
-        headers["Authorization"] = f"Bearer {PCE_JWT_TOKEN}"
+    token = jwt_token or PCE_JWT_TOKEN
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     else:
         logger.warning("PCE_JWT_TOKEN 未配置，将发送匿名请求（可能被 PCE 拒绝）")
     return headers
@@ -52,6 +53,7 @@ def create_task(
     payload: dict | None = None,
     idempotency_key: str | None = None,
     tenant_id: str | None = None,
+    jwt_token: str | None = None,
 ) -> str | None:
     """在 PCE 创建 Task，返回 task_id。
 
@@ -61,6 +63,7 @@ def create_task(
         payload: 业务负载（可选）
         idempotency_key: 幂等键（可选）。相同 key 重复请求返回相同 task_id。
         tenant_id: 请求级租户标识（R112-RECOVERY，从 X-Tenant-ID 传入）
+        jwt_token: 请求级 JWT token（GATE-L，从 incoming request 传播）
 
     Returns:
         str | None: 成功返回 task_id，失败降级返回 None
@@ -75,7 +78,7 @@ def create_task(
         resp = requests.post(
             TASKS_ENDPOINT,
             json=body,
-            headers=_build_headers(tenant_id=tenant_id),
+            headers=_build_headers(tenant_id=tenant_id, jwt_token=jwt_token),
             timeout=TASK_TIMEOUT,
         )
         if resp.ok:
@@ -97,6 +100,7 @@ def update_task_status(
     status: str,
     detail: dict | None = None,
     tenant_id: str | None = None,
+    jwt_token: str | None = None,
 ) -> bool:
     """更新 Task 状态（best-effort）。
 
@@ -106,6 +110,7 @@ def update_task_status(
         status: 目标状态（pending/running/completed/failed/cancelled）
         detail: 附加信息（可选）
         tenant_id: 请求级租户标识
+        jwt_token: 请求级 JWT token（GATE-L）
     Returns:
         bool: 成功 True，降级或未暴露 False
     """
@@ -118,7 +123,7 @@ def update_task_status(
         body["detail"] = detail
 
     try:
-        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id), timeout=TASK_TIMEOUT)
+        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id, jwt_token=jwt_token), timeout=TASK_TIMEOUT)
         if resp.ok:
             logger.info(f"PCE UpdateTaskStatus OK: {task_id} -> {status}")
             return True
@@ -136,6 +141,7 @@ def task_checkpoint(
     phase: str,
     detail: dict | None = None,
     tenant_id: str | None = None,
+    jwt_token: str | None = None,
 ) -> bool:
     """记录阶段 checkpoint（best-effort，404 降级）。
 
@@ -144,6 +150,7 @@ def task_checkpoint(
         phase: 阶段名（如 "evidence_collected" / "react_done"）
         detail: 附加信息（可选）
         tenant_id: 请求级租户标识
+        jwt_token: 请求级 JWT token（GATE-L）
     Returns:
         bool: 成功 True，降级或未暴露 False
     """
@@ -156,7 +163,7 @@ def task_checkpoint(
         body["detail"] = detail
 
     try:
-        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id), timeout=TASK_TIMEOUT)
+        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id, jwt_token=jwt_token), timeout=TASK_TIMEOUT)
         if resp.ok:
             logger.info(f"PCE TaskCheckpoint OK: {task_id} @ {phase}")
             return True
