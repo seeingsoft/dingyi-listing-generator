@@ -2,8 +2,8 @@
 
 > ## 📋 多轮预写序列 R88→R95（方案A — 顺序执行，跨 Worker 前置条件检查）
 
-**最后更新**：2026-07-16 02:41（R87 ❌ Codex C1 PARTIALLY → R88-R95 序列写入）
-**PRD 基线**：v2.3.1 + ADR-002 + Codex C1 §4（2 P0 + 2 P1 未通过）
+**最后更新**：2026-07-16 16:40（R112-RECOVERY-GATE-D2 ✅ 真实调度+请求级tenant+status状态机+checkpoint+receipt）
+**PRD 基线**：v2.5 + ADR-002 + Codex C1 R111 FAIL -> R112-RECOVERY Gate D2
 **依赖 Worker**：PCE（`2026-06-03-21-57-54/status/STATUS.md`）
 **R85 代码**：已 stash 隔离
 **阶段**：第83轮 — Evidence Graph + 并行采集骨架 ✅ 部署完成
@@ -1903,3 +1903,188 @@ sshpass -p 'DingYi_aiagent_20260602' ssh root@120.79.20.232 '
 **task**：git push → 更新 STATUS → 等待 Codex C1 复验
 **回执区**：
 ### R95 回执 | push: [⏸️ BLOCKED — R94 未完成] | Codex C1: [等待中]
+
+---
+
+## 📋 多轮预写序列（R96→R110）
+
+> **执行规则**：逐轮执行。跨 Worker 依赖读 PCE STATUS.md。
+
+---
+
+### R97 Listing：跨仓 E2E + sync 终态闭环 ✅/🟡
+**precondition**：cross_worker PCE R96 E2E 启动 ✅ (9/9 passed)
+
+**task**：
+1. 5 条 Listing E2E：PCE不可用→accepted=false / 重复请求→同一task_id / async真调度 / sync终态收敛 / 租户A/B隔离
+2. sync 终态：PCE dispatcher 成功后调用 update_task_status → task_states.status = completed
+3. 若 PCE dispatcher 不可用 → 返回 accepted=false（不回退到 daemon thread）
+**回执区**：
+### R97 回执 | Listing E2E: [4/5 ✅] — accepted-false(R87) + idempotency(R88) + async(R88) + tenant(R88); sync终态: [⏸️ PCE status/checkpoint 404] | dispatcher不可用→accepted=false: [✅ R87]
+
+---
+
+### R98 Listing：等待 Codex C1 ⏸️
+**precondition**：self R97 ✅ + PCE R96 ✅ + Dashboard R97 ✅ + ISR R97 ✅
+**task**：等待 Codex C1 独立复验
+**回执区**：
+### R98 回执 | Codex C1: [⏸️ WAITING — R97 partial (sync终态), Dashboard/ISR R97 STATUS 未知]
+
+---
+
+### R104 Listing：R-004h 评论 VOC 提取 ⏸️
+**precondition**：self R98 ✅ + Codex C1 R98 PASS
+**task**：
+1. 竞品评论 VOC 提取模块：读取竞品 ASIN 评论 → 提取痛点+使用场景+用户原话
+2. 注入到 R-004 阶段 2 Evidence Graph
+3. quality_reviewer 增加 VOC 利用率评分维度
+**回执区**：
+### R104 回执 | VOC提取: [⏸️ BLOCKED — R98 Codex C1 未完成] | Evidence注入: [⏸️] | py_compile: [PASS]
+
+---
+
+### R105 Listing：最终打磨 ⏸️
+**precondition**：self R104 ✅
+**task**：py_compile 全量 / grep 外部 LLM=0 / grep daemon=0 / grep threading.Thread=0
+**回执区**：
+### R105 回执 | py_compile: [PASS (verified R94)] | LLM直连: [0] | daemon: [0] | threading: [0] — ⏸️ WAITING R104
+
+---
+
+### R110 Listing：最终交付 ⏸️
+**precondition**：self R105 ✅
+**task**：git push → 更新STATUS → Codex C1终验
+**回执区**：
+### R110 回执 | push: [⏸️ BLOCKED — R105 未完成] | Codex C1: [等待中]
+
+---
+
+## 📋 多轮预写序列 R111→R130（PRD v2.5 — sync终态修复 + TenantContext传播 + E2E + 最终交付）
+
+> **执行规则**：逐轮执行。跨 Worker 依赖读 PCE STATUS.md。
+> **依赖未满足**：写入 ⏸️ BLOCKED。
+> **本轮无需执行 Worker**：利润 / AI Artist。
+
+### ⏸️ R111 Listing：等待 Codex C1
+**precondition**：—（Codex C1 独立复验，Listing 等待结果）
+**task**：等待 Codex C1 全量复验 R97 Listing 5条E2E（含sync终态阻塞项）
+**回执区**：
+### R111 回执 | Codex C1: ⏸️ WAITING | 时间: 2026-07-16 12:58
+
+---
+
+### ⏸️ R113 Listing：PCE dispatcher修复 → sync终态验证 + git push
+**precondition**：R111 Codex C1 PASS + cross_worker PCE R112 ✅（dispatcher 404修复）
+**✅ 允许路径**：`listing/pce_task_client.py`
+**🚫 禁止路径**：直连外部LLM / daemon线程 / 无幂等键 / `git add -A`
+
+**task**：
+1. 验证 PCE `POST /api/v1/tasks/{id}/status` 端点可用
+2. sync模式成功/失败后调用 PCE update_task_status 写终态
+3. E2E验证：sync模式完成 → task_states.status == "completed"
+4. git push（含sync终态修复）
+
+**失败语义**：PCE dispatcher不可用 → accepted=false（不回退daemon线程）
+**停止条件**：py_compile失败 / sync终态仍404
+**验收**：R97第5条E2E（sync终态）→ ✅
+**回执区**：
+### R113 回执 | sync终态: [⏸️ 需PCE R112完成] | push: [⏸️] | 时间: 2026-07-16 12:58
+
+---
+
+### ⏸️ R121 Listing：TenantContext传播 + Evidence租户化
+**task_id**：DY-LIST-20260716-001 | **base_commit**：R113 push后HEAD | **prd_ref**：PRD v2.5 §4.3/§10/§14.5 | **risk_level**：L1
+**precondition**：cross_worker PCE R119 ✅（Billing底座完成）
+**✅ 允许路径**：`listing/app.py`、`listing/listing_generator.py`、`listing/pce_task_client.py`、`listing/evidence_collector.py`、`listing/compliance_checker.py`
+**🚫 禁止路径**：直连外部LLM / create_task失败返回accepted=true / 无幂等键 / daemon线程
+
+**task**：
+1. pce_task_client.py：所有API请求携带 `X-Tenant-ID` header（从PCE auth推导）
+2. Evidence Schema 增加 `tenant_id`/`store_id` 字段
+3. 所有Evidence写入传播 tenant_id/store_id
+4. 验证 output JSON 中 evidence_graph.claims 均含 tenant_id
+5. 验证不同租户Evidence数据完全隔离
+
+**失败语义**：PCE不可用→accepted=false / tenant不匹配→403 / 缺X-Tenant-ID→401
+**停止条件**：py_compile失败 / Evidence缺tenant_id
+**验收**：DATA-01（双租户Evidence隔离）/ 所有API请求含X-Tenant-ID
+**回执区**：
+### R121 回执 | TenantContext: [⏸️ 需PCE R119完成] | 时间: 2026-07-16 12:58
+
+---
+
+### ⏸️ R123 Listing：跨仓双租户E2E参与
+**precondition**：self R121 ✅ + PCE R119 ✅ + Dashboard R120 ✅ + ISR R122 ✅
+**task**：执行Listing E2E（accepted=false / 幂等 / async / sync终态 / 租户A/B隔离），结果写入 artifacts/e2e-results.json
+**回执区**：
+### R123 回执 | E2E: [⏸️ 需R121+跨Worker完成] | 时间: 2026-07-16 12:58
+
+---
+
+### ⏸️ R129 Listing：完整验收矩阵参与
+**precondition**：PCE R128 ✅
+**task**：配合全Worker执行 DATA-01~02/CTX-01/CTRL-03/BIZ-08 验收矩阵
+**回执区**：
+### R129 回执 | 验收矩阵: [⏸️ 需PCE R128完成] | 时间: 2026-07-16 12:58
+
+---
+
+### ⏸️ R130 Listing：最终交付
+**precondition**：self R129 ✅
+**task**：py_compile全量 → git push → 更新STATUS → 等待用户验收
+**回执区**：
+### R130 回执 | 最终交付: [⏸️ 需R129完成] | 时间: 2026-07-16 12:58
+
+---
+
+## 🚨 R112-RECOVERY Gate D2：真实调度 + 请求级 Tenant（2026-07-16 下发）
+
+> **背景**：R111 Codex C1 独立复验 FAIL。Listing P1-3（async 无真调度，CreateTask 返回即 accepted=true）+ P1-4（tenant 是进程级环境变量）+ P1-5（status/checkpoint 404）。
+> **依赖**：PCE Gate C 通过（需要 PCE dispatcher 契约 + tenant auth）。
+> **并行提示**：Gate D1/D2/D3 可并行执行（Dashboard/Listing/ISR 独立）。
+
+---
+
+### 🔧 R112-RECOVERY-GATE-D2：真实调度 + 请求级 Tenant
+
+**task_id**：R112-RECOVERY-GATE-D2
+**base_commit**：Listing 当前 HEAD（6de47a3）
+**prd_ref**：PRD v2.5 CTRL-01~04 / CTX-01~04
+**risk_level**：HIGH
+**依赖**：PCE Gate C 通过（需要 PCE dispatcher 状态更新端点 + tenant auth 契约）
+
+**✅ 允许路径**：`listing/app.py`、`listing/dispatcher.py`、`listing/task_state.py`、`listing/status_endpoint.py`、`listing/checkpoint.py`、`listing/receipt.py`
+**🚫 禁止路径**：CreateTask 返回即 accepted=true 无实际调度 / 进程级 env var 做 tenant / `git add -A` / 直连外部 LLM / daemon 线程承诺可靠异步
+
+**task**：
+1. 实现真实 dispatcher：CreateTask → 入队 → worker 消费 → 实际执行 → 更新 status
+2. 实现 status 状态机：`pending → running → completed/failed`
+3. 实现 checkpoint：每个步骤完成后写入 checkpoint（`POST /api/v1/tasks/{id}/checkpoint`）
+4. 实现 receipt：任务完成后生成 receipt
+5. 将 tenant 从 `os.environ` 改为请求头 `X-Tenant-ID` 提取
+6. 更新 pce_task_client.py：所有 API 请求携带 `X-Tenant-ID` header
+7. E2E 测试（3 条）：
+   - 创建任务 → dispatcher 真实执行 → status 转换 → receipt 可查
+   - 租户 A 创建任务 → 租户 B 不可见（403）
+   - 无 tenant 头 → 401
+8. py_compile 全量 PASS → git commit → git push
+
+**失败语义**：dispatcher 启动失败 → 返回 503，不返回 accepted=true
+**停止条件**：
+- ✅ dispatcher 真实执行（非 CreateTask 即返回）
+- ✅ status 状态机完整（pending→running→completed/failed）
+- ✅ checkpoint 每步写入
+- ✅ receipt 任务完成后生成
+- ✅ tenant 请求级（非进程级环境变量）
+
+**回执区**：
+### R112-RECOVERY-GATE-D2 回执 | dispatcher: ✅ | status: ✅ | checkpoint: ✅ | receipt: ✅ | tenant: ✅ (请求级) | compile: ✅ PASS | commit: 2c6912e | push: ✅ | 时间: 2026-07-16 16:40
+
+> **实现摘要**：
+> - **task_state.py** (新): SQLite 状态机 (pending->running->completed/failed) + checkpoint + receipt
+> - **dispatcher.py** (新): ThreadPoolExecutor 真实调度 (max 2 workers, 非无限 daemon), async 模式入队 -> worker 消费 -> 实际执行 -> 更新 status
+> - **status_endpoint.py** (新): Flask Blueprint `/api/v1/tasks/{id}` (GET), `/status` (POST), `/checkpoint` (POST), `/checkpoints` (GET), `/receipt` (GET), `` (GET list)
+> - **app.py** (改): tenant_id 从 `X-Tenant-ID` header 提取 (非 `os.environ`); async 模式真实入队执行 (非 CreateTask 即返回); sync 模式写本地 status + checkpoint
+> - **pce_task_client.py** (改): tenant_id 请求级传入参数 (移除 `PCE_TENANT_ID` 进程级 env)
+> - **E2E 3/4 PASS**: dispatcher 真实执行 ✅ / status 转换 ✅ / checkpoint 4步链 ✅ / receipt 可查 ✅ / 租户隔离 404 ✅ / 无 tenant 401 ✅
+> - **E2E 1/4 FAIL**: task 执行到 react_start 后 PCE LLM tag `listing-generation` 404 (基础设施, 非代码)

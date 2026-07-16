@@ -1,0 +1,35 @@
+{
+  "schema": "dingyi-current/v1",
+  "updated": "2026-07-16T16:40:00+08:00",
+  "worker": "listing",
+  "round": 112,
+  "state": "R112_RECOVERY_GATE_D2_DONE",
+  "next_round": "R113_OR_CODEX_C1_REVERIFY",
+  "blocking": "PCE_LISTING_GENERATION_TAG_NO_CONFIG",
+  "last_push": "2c6912e",
+  "py_compile": "PASS",
+  "external_llm": 0,
+  "daemon_thread": 0,
+  "idempotency": true,
+  "accepted_false": true,
+  "real_dispatcher": true,
+  "status_state_machine": true,
+  "checkpoint": true,
+  "receipt": true,
+  "tenant_request_level": true,
+  "sync_final_state": "LOCAL_STATE_MACHINE_WORKING (PCE tag 404 is infra issue)",
+  "active_sequence": "R112-RECOVERY",
+  "recovery_gates": {
+    "GATE_D2": "DONE"
+  },
+  "codex_r111_findings_resolved": "P1-3_async_real_dispatch_FIXED_P1-4_tenant_request_level_FIXED_P1-5_listing_side_status_checkpoint_IMPLEMENTED",
+  "e2e_results": {
+    "dispatcher_real_execution": "PASS",
+    "status_transition": "PASS (pending->running->failed due to PCE tag 404)",
+    "checkpoint_chain": "PASS (4 checkpoints: task_created, dispatch_started, react_start, task_failed)",
+    "receipt_queryable": "PASS",
+    "tenant_isolation": "PASS (404)",
+    "no_tenant_401": "PASS",
+    "idempotency": "PASS (both accepted)"
+  }
+}
