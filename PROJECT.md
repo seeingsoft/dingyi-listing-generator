@@ -1,7 +1,7 @@
 # PROJECT.md — 鼎一 Listing 生成 Plugin
 
 **创建时间**：2026-07-06
-**阶段**：Phase 1 — MVP 开发
+**阶段**：R122 文档收口完成（PRD v2.5，等待 R123 Codex C1 终验）
 **负责人**：江信颖
 
 ---
@@ -59,16 +59,15 @@ POST {PCE_API_BASE}/api/v1/llm/call
 }
 ```
 
-**标签映射**（PCE `cmd/engine/main.go` 第 88 行）：
+**标签映射**（PCE `cmd/engine/main.go` RegisterPreferredTag）：
 ```
-listing-generation → deepseek-v4-pro
+listing-generation → deepseek-v4-pro（tag alias；DB config model=deepseek-chat）
 ```
 
-**实测延迟**：1355ms（PCE STATUS.md 确认）
-
-**PCE 部署状态**：
-- 生产服务器（120.79.20.232）：PCE 尚未部署（PRE-06 待执行），当前 ISR 直连 DeepSeek API
-- 本地开发环境：PCE 运行在 `localhost:8080`，listing-generation 标签已就绪
+**PCE 部署状态**（2026-07-17 更新）：
+- 生产服务器（120.79.20.232）：PCE 已部署，运行在 `:8180`（systemd: dingyi-engine）
+- LLM config 存于 `/opt/tools/platform-core-engine/data/llm.db`（status 须为 "online"）
+- Listing 服务运行在 `127.0.0.1:5001`（gunicorn 独立进程，非 tool-amazon-prod）
 
 ---
 
@@ -115,15 +114,23 @@ MCP capability: listing-generate
 
 ## 目录结构
 
+> 完整架构见 `listing/README.md`（R122 交付）
+
 ```
 listing/
-├── PROJECT.md
-├── app.py                    # Flask 主入口
-├── listing_generator.py      # Prompt 工程 + PCE /call 调用
-├── compliance_checker.py     # 合规词库校验
+├── README.md / API.md        # R122 文档（技术栈/API 参考）
+├── app.py                    # Flask 主入口（JWT 验证 + 租户隔离）
+├── listing_generator.py      # Prompt 工程 + PCE /api/v1/llm/call
+├── react_agent.py            # ReAct 代理引擎
+├── task_state.py             # 本地 SQLite 状态机 + 幂等映射
+├── dispatcher.py             # ThreadPoolExecutor 真实调度
+├── status_endpoint.py        # task status/checkpoint/receipt API
+├── pce_task_client.py        # PCE Task API 客户端
+├── evidence_collector.py     # ISR 并行证据采集（tenant 传播）
+├── quality_reviewer.py       # Pro 独立评审
+├── compliance_*.py           # 合规检查（3 文件）
+├── image_extractor.py / publisher.py / variant_generator.py / report_generator.py
 ├── mcp_register.py           # MCP 注册脚本
-├── requirements.txt
-├── .env.example
-└── status/
-    └── STATUS.md
+├── requirements.txt          # flask/gunicorn/requests/PyJWT
+└── .env.example
 ```
