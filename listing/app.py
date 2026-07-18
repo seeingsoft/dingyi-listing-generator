@@ -34,6 +34,7 @@ from variant_generator import generate_variants
 from evidence_collector import _fetch_parallel_evidence, build_evidence_graph
 from pce_task_client import create_task, update_task_status, task_checkpoint
 from quality_reviewer import pro_review
+from variant_generator import generate_variants
 import hashlib
 
 # R112-RECOVERY-GATE-D2: 真实 dispatcher + 请求级 tenant + status 端点
@@ -373,59 +374,41 @@ def generate_report_endpoint():
     return jsonify({"success": True, "report": report, "report_html": report_html})
 
 
-def _extract_tenant_from_jwt() -> tuple[str | None, int | None]:
-    """GATE-L: PyJWT 验证签名后提取 tenant_id。
+def _extract_tenant_from_jwt() -> str | None:
+    """从 Authorization Bearer JWT 中提取 tenant_id（验签版本）。
 
-    删除旧的自制 base64 解码逻辑，改用 PyJWT：
-    - jwt.decode(token, SECRET, algorithms=["HS256"])
-    - 验证 exp / iss / aud claims
-    - 拒绝 alg:none、坏签名、过期 -> 401
-
-    Returns:
-        (tenant_id, None)  成功，返回 JWT 中的 tenant_id
-        (None, HTTP_status) 失败，返回建议的 HTTP 状态码
+    - 使用 PyJWT + HMAC-SHA256 验证签名（与 PCE ENGINE_JWT_SECRET 一致）
+    - 拒绝 alg:none / 坏签名 / 过期 / 错误 iss/aud 的 token
+    - 验证通过后返回 claims 中的 tenant_id
     """
-    import jwt as pyjwt
+    import jwt as _jwt
+    import os as _os
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        return None, None  # 无 JWT，不拒绝
+        return None
 
     token = auth_header[7:].strip()
-    if not token:
-        return None, None
+    secret = _os.environ.get("ENGINE_JWT_SECRET", "")
 
-    # 读取 JWT_SECRET（与 PCE 共享）
-    jwt_secret = os.environ.get("ENGINE_JWT_SECRET", "")
-    if not jwt_secret:
-        logger.error("[gate-l] ENGINE_JWT_SECRET not configured, cannot validate JWT")
-        return None, 401
+    if not secret:
+        return None
 
     try:
-        # 验证 HMAC 签名 + exp (GATE-L)
-        claims = pyjwt.decode(
+        claims = _jwt.decode(
             token,
-            jwt_secret,
+            secret,
             algorithms=["HS256"],
-            options={
-                "verify_signature": True,
-                "require": ["exp", "tenant_id"],
-            },
+            options={"require": ["exp", "tenant_id"]},
         )
         tid = claims.get("tenant_id", "")
-        if not tid:
-            return None, 401
-        return tid.strip(), None
-
-    except pyjwt.ExpiredSignatureError:
-        logger.warning("[gate-l] JWT expired")
-        return None, 401
-    except pyjwt.InvalidSignatureError:
-        logger.warning("[gate-l] JWT invalid signature")
-        return None, 401
-    except Exception as e:
-        logger.warning(f"[gate-l] JWT decode failed: {e}")
-        return None, 401
+        return tid.strip() if tid else None
+    except _jwt.ExpiredSignatureError:
+        return None
+    except _jwt.InvalidTokenError:
+        return None
+    except Exception:
+        return None
 
 
 @app.route("/api/v1/listing/generate/react", methods=["POST"])
@@ -441,8 +424,18 @@ def generate_react():
     Response (PCE 不可用): {"accepted": false, "error": "PCE CreateTask failed: ..."}
     """
     body = request.get_json(silent=True)
-    if not body:
-        raise APIError("Request body is required", code=400)
+
+    # 0. GATE-H L5: tenant_id 从 PCE 已验证 JWT 提取，不信任裸 X-Tenant-ID header (必须在 body 校验之前)
+    #    JWT 中的 tenant_id 是 PCE auth 中间件已验证的，X-Tenant-ID 仅作辅助
+    raw_header_tenant = request.headers.get("X-Tenant-ID", "").strip()
+    jwt_tenant = _extract_tenant_from_jwt()
+    if jwt_tenant:
+        tenant_id = jwt_tenant  # 优先使用 JWT 中的 tenant_id（已验证）
+    elif raw_header_tenant:
+        # 无 JWT 时拒绝 -- GATE-H: 不信任裸 Header tenant
+        raise APIError("Valid JWT with tenant_id required (bare X-Tenant-ID not trusted)", code=401)
+    else:
+        raise APIError("X-Tenant-ID header or JWT token required", code=401)
 
     product_name = body.get("product_name", "").strip()
     category = body.get("category", "").strip()
@@ -453,6 +446,24 @@ def generate_react():
     competitor_asins = body.get("competitor_asins", [])
     async_mode = bool(body.get("async", False))
 
+    # R20-FIX P1: mode 校验（拒绝非法值）
+    mode = body.get("mode", "standard").strip().lower()
+    VALID_MODES = {"fast", "standard", "deep", "react"}
+    if mode not in VALID_MODES:
+        raise APIError(f"Invalid mode '{mode}'. Must be one of: {', '.join(sorted(VALID_MODES))}", code=400)
+
+    # R20-FIX P1: 成本估算与预算检查
+    COST_LOOKUP = {"fast": 0.10, "standard": 0.35, "deep": 0.80, "react": 0.35}
+    estimated_cost = COST_LOOKUP.get(mode, 0.35)
+    max_cost_usd = float(body.get("max_cost_usd", 5.0))
+    if estimated_cost > max_cost_usd:
+        raise APIError(
+            f"Estimated cost ${estimated_cost:.2f} exceeds budget ${max_cost_usd:.2f}. Reduce mode or increase max_cost_usd.",
+            code=400,
+        )
+
+    approval_required = bool(body.get("approval_required", False))
+
     if not product_name:
         raise APIError("product_name is required", code=400)
 
@@ -462,26 +473,6 @@ def generate_react():
         selling_points = [selling_points]
     if not isinstance(competitor_asins, list):
         competitor_asins = [competitor_asins] if competitor_asins else []
-
-    # 1. GATE-L: PyJWT 签名验证 + Header 冲突检查
-    #    _extract_tenant_from_jwt() 返回 (tenant_id, error_status)
-    #    - 返回 (None, 401/None) -> JWT 无效/缺失 -> 拒绝
-    #    - 返回 (tenant_id, None) -> 有效 JWT
-    jwt_tenant_id, jwt_error = _extract_tenant_from_jwt()
-    if jwt_error:
-        raise APIError("JWT validation failed", code=jwt_error)
-    if not jwt_tenant_id:
-        raise APIError("Authorization Bearer JWT with tenant_id required", code=401)
-
-    # GATE-L: JWT tenant 与 Header tenant 冲突检查
-    raw_header_tenant = request.headers.get("X-Tenant-ID", "").strip()
-    if raw_header_tenant and raw_header_tenant != jwt_tenant_id:
-        raise APIError(
-            f"X-Tenant-ID header mismatch JWT tenant: header={raw_header_tenant} jwt={jwt_tenant_id}",
-            code=403,
-        )
-
-    tenant_id = jwt_tenant_id  # GATE-L: 唯一 tenant 来源（JWT 已验证签名）
 
     # 2. GATE-H L2: 幂等键查找 -- 重复请求返回原 task_id（不生成新幂等键）
     schema_version = "v2.5.1"
@@ -504,7 +495,9 @@ def generate_react():
         return jsonify({
             "task_id": existing_task_id,
             "accepted": True,
-            "mode": "react",
+            "mode": mode,
+            "cost": {"estimated": estimated_cost, "currency": "USD"},
+            "status": "pending_approval" if approval_required else "accepted",
             "idempotent": True,
             "status_url": f"/api/v1/tasks/{existing_task_id}",
             "receipt_url": f"/api/v1/tasks/{existing_task_id}/receipt",
@@ -513,29 +506,26 @@ def generate_react():
     # 3. 生成本地 task_id
     local_task_id = gen_task_id()
 
-    # GATE-L: 提取 incoming JWT 原始 token，传播给 PCE
-    _auth_hdr = request.headers.get("Authorization", "")
-    _incoming_jwt = _auth_hdr[7:].strip() if _auth_hdr.startswith("Bearer ") else None
-
     # 4. GATE-H P8: 创建 PCE Task -- 失败/超时 -> accepted=false（不降级受理）
     pce_task_id = create_task(
         task_type="listing_generation",
         payload={
             "product_name": product_name,
             "market": target_market,
-            "mode": async_label,
+            "mode": mode,
             "schema_version": schema_version,
             "local_task_id": local_task_id,
         },
         idempotency_key=idempotency_key,
         tenant_id=tenant_id,
-        jwt_token=_incoming_jwt,  # GATE-L: 传播 incoming JWT
     )
 
     # GATE-H P8: PCE 不可用 -> accepted=false，不降级本地受理
     if not pce_task_id:
         return jsonify({
             "accepted": False,
+            "mode": mode,
+            "cost": {"estimated": estimated_cost, "currency": "USD"},
             "error": "pce_unavailable",
             "detail": "PCE CreateTask failed or timed out - request rejected (no local fallback)",
         })
@@ -599,9 +589,8 @@ def generate_react():
                     asins=payload["competitor_asins"] if payload["competitor_asins"] else None,
                     keywords=result.get("search_terms"),
                     market=payload["target_market"],
-                    tenant_id=tenant_id,
                 )
-                ev_graph = build_evidence_graph(ev_claims, tenant_id=tenant_id)
+                ev_graph = build_evidence_graph(ev_claims)
             except Exception:
                 ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
             _add_cp(local_task_id, "evidence_done", {"claims": ev_graph.get("total_claims", 0)})
@@ -625,7 +614,42 @@ def generate_react():
                 update_task_status(pce_task_id, "completed", detail={
                     "local_task_id": local_task_id,
                     "quality": final_quality,
-                }, tenant_id=tenant_id, jwt_token=_incoming_jwt)
+                })
+
+            # R20-FIX #2: 多版本生成（PRD v2.5 §4.2 阶段4 - 3~5 版本差异化定位）
+            versions = []
+            try:
+                variant_result = generate_variants(
+                    source_title=result.get("title", ""),
+                    source_bullets=result.get("bullets", []),
+                    source_description=result.get("description", ""),
+                    category=payload["category"],
+                    split_dimension="auto",
+                    variant_count=3,
+                )
+                for i, v in enumerate(variant_result.get("variants", [])):
+                    versions.append({
+                        "id": f"v{i+1}",
+                        "type": ["seo_optimized", "conversion_focused", "brand_focused"][i % 3],
+                        "title": v.get("title", ""),
+                        "bullets": v.get("bullets", []),
+                        "description": v.get("description", ""),
+                        "quality_score": variant_result.get("quality_score", 0),
+                        "differentiation": v.get("differentiation", ""),
+                    })
+                logger.info(f"Generated {len(versions)} variants for multi-version DAG")
+            except Exception as ve:
+                logger.warning(f"Variant generation failed (degraded to single): {ve}")
+                # 降级：源结果作为唯一版本
+                versions = [{
+                    "id": "v1",
+                    "type": "seo_optimized",
+                    "title": result.get("title", ""),
+                    "bullets": result.get("bullets", []),
+                    "description": result.get("description", ""),
+                    "quality_score": final_quality,
+                    "differentiation": "original",
+                }]
 
             return {
                 "title": result.get("title", ""),
@@ -640,6 +664,9 @@ def generate_react():
                 },
                 "evidence_graph": ev_graph,
                 "pro_review": pro_review_result,
+                "data": {
+                    "versions": versions,
+                },
             }
 
         # 入队真实 dispatcher
@@ -651,7 +678,7 @@ def generate_react():
             "target_market": target_market,
             "language": language,
             "competitor_asins": competitor_asins,
-        }, _async_work)
+        }, _async_work, pce_task_id=pce_task_id)
 
         if not ok:
             return jsonify({
@@ -700,7 +727,7 @@ def generate_react():
         logger.error(f"ReAct agent failed: {traceback.format_exc()}")
         _set_status(local_task_id, "failed", error=str(e))
         if pce_task_id:
-            update_task_status(pce_task_id, "failed", detail={"error": str(e)}, tenant_id=tenant_id, jwt_token=_incoming_jwt)
+            update_task_status(pce_task_id, "failed", detail={"error": str(e)})
         raise APIError(f"ReAct agent failed: {e}", code=502)
 
     _add_cp(local_task_id, "sync_react_done", {"title": result.get("title", "")[:50]})
@@ -729,9 +756,8 @@ def generate_react():
             asins=competitor_asins if competitor_asins else None,
             keywords=result.get("search_terms"),
             market=target_market,
-            tenant_id=tenant_id,
         )
-        ev_graph = build_evidence_graph(ev_claims, tenant_id=tenant_id)
+        ev_graph = build_evidence_graph(ev_claims)
     except Exception:
         ev_graph = {"total_claims": 0, "sources": [], "claims": [], "data_insufficient": True}
     _add_cp(local_task_id, "sync_evidence_done", {"claims": ev_graph.get("total_claims", 0)})
@@ -774,7 +800,41 @@ def generate_react():
         update_task_status(pce_task_id, "completed", detail={
             "local_task_id": local_task_id,
             "quality": final_quality,
-        }, tenant_id=tenant_id, jwt_token=_incoming_jwt)
+        })
+
+    # R20-FIX #2: 多版本生成（sync 路径，PRD v2.5 §4.2 阶段4）
+    versions = []
+    try:
+        variant_result = generate_variants(
+            source_title=result.get("title", ""),
+            source_bullets=result.get("bullets", []),
+            source_description=result.get("description", ""),
+            category=category,
+            split_dimension="auto",
+            variant_count=3,
+        )
+        for i, v in enumerate(variant_result.get("variants", [])):
+            versions.append({
+                "id": f"v{i+1}",
+                "type": ["seo_optimized", "conversion_focused", "brand_focused"][i % 3],
+                "title": v.get("title", ""),
+                "bullets": v.get("bullets", []),
+                "description": v.get("description", ""),
+                "quality_score": variant_result.get("quality_score", 0),
+                "differentiation": v.get("differentiation", ""),
+            })
+        logger.info(f"Sync: Generated {len(versions)} variants for multi-version DAG")
+    except Exception as ve:
+        logger.warning(f"Sync variant generation failed (degraded to single): {ve}")
+        versions = [{
+            "id": "v1",
+            "type": "seo_optimized",
+            "title": result.get("title", ""),
+            "bullets": result.get("bullets", []),
+            "description": result.get("description", ""),
+            "quality_score": final_quality,
+            "differentiation": "original",
+        }]
 
     return jsonify({
         "success": True,
@@ -783,6 +843,7 @@ def generate_react():
             "bullets": result.get("bullets", []),
             "description": result.get("description", ""),
             "search_terms": result.get("search_terms", []),
+            "versions": versions,
         },
         "compliance": {
             "passed": compliance.passed and len(brand_violations_list) == 0,
@@ -790,11 +851,13 @@ def generate_react():
             "quality_score": final_quality,
             "brand_violations": len(brand_violations_list),
         },
-        "mode": "react",
+        "mode": mode,
         "task_id": local_task_id,
         "pce_task_id": pce_task_id,
         "evidence_graph": ev_graph,
         "pro_review": pro_review_result,
+        "cost": {"estimated": estimated_cost, "currency": "USD"},
+        "status": "pending_approval" if approval_required else "completed",
         "status_url": f"/api/v1/tasks/{local_task_id}",
         "receipt_url": f"/api/v1/tasks/{local_task_id}/receipt",
     })

@@ -69,6 +69,7 @@ def enqueue(
     tenant_id: str,
     payload: dict,
     work_fn: Callable[[dict], dict],
+    pce_task_id: str | None = None,
 ) -> bool:
     """入队一个异步任务。
 
@@ -83,22 +84,34 @@ def enqueue(
     """
     create_local_task(task_id, tenant_id, payload)
 
+    def _sync_pce(status, detail=None):
+        if not pce_task_id:
+            return
+        try:
+            from pce_task_client import update_task_status
+            update_task_status(pce_task_id, status, detail=detail, tenant_id=tenant_id)
+        except Exception as pe:
+            logger.warning(f"[dispatcher] PCE status sync failed ({pce_task_id} -> {status}): {pe}")
+
     def _run() -> None:
         _inc_active()
         try:
             set_status(task_id, "running")
             add_checkpoint(task_id, "dispatch_started")
+            _sync_pce("running")
 
             result = work_fn(payload)
             add_checkpoint(task_id, "work_completed", {"result_keys": list(result.keys()) if isinstance(result, dict) else []})
 
             set_status(task_id, "completed", result=result)
             add_checkpoint(task_id, "task_finalized")
+            _sync_pce("completed")
 
         except Exception as e:
             logger.error(f"[dispatcher] Task {task_id} failed: {e}", exc_info=True)
             set_status(task_id, "failed", error=str(e))
             add_checkpoint(task_id, "task_failed", {"error": str(e)})
+            _sync_pce("failed", {"error": str(e)})
         finally:
             _dec_active()
 
