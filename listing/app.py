@@ -687,7 +687,9 @@ def generate_react():
             "task_id": local_task_id,
             "pce_task_id": pce_task_id,
             "accepted": True,
-            "mode": "react",
+            "mode": mode,
+            "cost": {"estimated": estimated_cost, "currency": "USD"},
+            "status": "pending_approval" if approval_required else "accepted",
             "status_url": f"/api/v1/tasks/{local_task_id}",
             "receipt_url": f"/api/v1/tasks/{local_task_id}/receipt",
         })
