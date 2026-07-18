@@ -609,12 +609,8 @@ def generate_react():
                 logger.warning(f"Pro review skipped (degraded): {e}")
             _add_cp(local_task_id, "review_done")
 
-            # best-effort 更新 PCE task 终态
-            if pce_task_id:
-                update_task_status(pce_task_id, "completed", detail={
-                    "local_task_id": local_task_id,
-                    "quality": final_quality,
-                })
+            # R22-FIX-B: PCE 终态回写统一由 dispatcher._sync_pce 负责
+            # （避免此处提前置 completed 与审批门禁 waiting_approval 竞争）
 
             # R20-FIX #2: 多版本生成（PRD v2.5 §4.2 阶段4 - 3~5 版本差异化定位）
             versions = []
@@ -678,7 +674,7 @@ def generate_react():
             "target_market": target_market,
             "language": language,
             "competitor_asins": competitor_asins,
-        }, _async_work, pce_task_id=pce_task_id)
+        }, _async_work, pce_task_id=pce_task_id, approval_required=approval_required)
 
         if not ok:
             return jsonify({

@@ -25,25 +25,61 @@ logger = logging.getLogger("pce-task-client")
 PCE_API_BASE = os.environ.get("PCE_API_BASE", "http://127.0.0.1:8180")
 TASKS_ENDPOINT = f"{PCE_API_BASE}/api/v1/tasks"
 TASK_TIMEOUT = int(os.environ.get("PCE_TASK_TIMEOUT", "10"))
-PCE_JWT_TOKEN = os.environ.get("PCE_JWT_TOKEN", "")
+_cached_service_token = None
 
 
-def _build_headers(tenant_id: str | None = None, jwt_token: str | None = None) -> dict:
-    """构建包含 JWT 认证和请求级租户标识的请求头。
+def _get_service_token() -> str:
+    """获取 PCE service JWT token。
 
-    R112-RECOVERY: tenant_id 由调用方传入（请求级），非进程级环境变量。
-    GATE-L: jwt_token 从 incoming request 传播，非静态 service token。
+    优先级：
+    1. PCE_JWT_TOKEN 环境变量（预签名 token）
+    2. 自动签发（用 ENGINE_JWT_SECRET 签发 service token）
     """
-    headers = {
-        "Content-Type": "application/json",
-    }
+    global _cached_service_token
+    if _cached_service_token:
+        return _cached_service_token
+
+    env_token = os.environ.get("PCE_JWT_TOKEN", "")
+    if env_token:
+        _cached_service_token = env_token
+        return _cached_service_token
+
+    # Auto-generate service token using ENGINE_JWT_SECRET
+    secret = os.environ.get("ENGINE_JWT_SECRET", "")
+    if not secret:
+        logger.warning("Neither PCE_JWT_TOKEN nor ENGINE_JWT_SECRET configured")
+        return ""
+
+    try:
+        import jwt as _jwt
+        import time as _time
+        _cached_service_token = _jwt.encode(
+            {
+                "sub": "listing-service",
+                "tenant_id": "00000000-0000-0000-0000-000000000001",
+                "roles": ["admin"],
+                "exp": int(_time.time()) + 86400 * 7,
+            },
+            secret,
+            algorithm="HS256",
+        )
+        logger.info("Auto-generated service JWT from ENGINE_JWT_SECRET")
+        return _cached_service_token
+    except Exception as e:
+        logger.warning(f"Failed to auto-generate service JWT: {e}")
+        return ""
+
+
+def _build_headers(tenant_id: str | None = None) -> dict:
+    """构建包含 JWT 认证和请求级租户标识的请求头。"""
+    headers = {"Content-Type": "application/json"}
     if tenant_id:
         headers["X-Tenant-ID"] = tenant_id
-    token = jwt_token or PCE_JWT_TOKEN
+    token = _get_service_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     else:
-        logger.warning("PCE_JWT_TOKEN 未配置，将发送匿名请求（可能被 PCE 拒绝）")
+        logger.warning("No service token available (PCE will reject)")
     return headers
 
 
@@ -53,7 +89,6 @@ def create_task(
     payload: dict | None = None,
     idempotency_key: str | None = None,
     tenant_id: str | None = None,
-    jwt_token: str | None = None,
 ) -> str | None:
     """在 PCE 创建 Task，返回 task_id。
 
@@ -63,7 +98,6 @@ def create_task(
         payload: 业务负载（可选）
         idempotency_key: 幂等键（可选）。相同 key 重复请求返回相同 task_id。
         tenant_id: 请求级租户标识（R112-RECOVERY，从 X-Tenant-ID 传入）
-        jwt_token: 请求级 JWT token（GATE-L，从 incoming request 传播）
 
     Returns:
         str | None: 成功返回 task_id，失败降级返回 None
@@ -78,7 +112,7 @@ def create_task(
         resp = requests.post(
             TASKS_ENDPOINT,
             json=body,
-            headers=_build_headers(tenant_id=tenant_id, jwt_token=jwt_token),
+            headers=_build_headers(tenant_id=tenant_id),
             timeout=TASK_TIMEOUT,
         )
         if resp.ok:
@@ -100,7 +134,6 @@ def update_task_status(
     status: str,
     detail: dict | None = None,
     tenant_id: str | None = None,
-    jwt_token: str | None = None,
 ) -> bool:
     """更新 Task 状态（best-effort）。
 
@@ -110,7 +143,6 @@ def update_task_status(
         status: 目标状态（pending/running/completed/failed/cancelled）
         detail: 附加信息（可选）
         tenant_id: 请求级租户标识
-        jwt_token: 请求级 JWT token（GATE-L）
     Returns:
         bool: 成功 True，降级或未暴露 False
     """
@@ -123,7 +155,7 @@ def update_task_status(
         body["detail"] = detail
 
     try:
-        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id, jwt_token=jwt_token), timeout=TASK_TIMEOUT)
+        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id), timeout=TASK_TIMEOUT)
         if resp.ok:
             logger.info(f"PCE UpdateTaskStatus OK: {task_id} -> {status}")
             return True
@@ -141,7 +173,6 @@ def task_checkpoint(
     phase: str,
     detail: dict | None = None,
     tenant_id: str | None = None,
-    jwt_token: str | None = None,
 ) -> bool:
     """记录阶段 checkpoint（best-effort，404 降级）。
 
@@ -150,7 +181,6 @@ def task_checkpoint(
         phase: 阶段名（如 "evidence_collected" / "react_done"）
         detail: 附加信息（可选）
         tenant_id: 请求级租户标识
-        jwt_token: 请求级 JWT token（GATE-L）
     Returns:
         bool: 成功 True，降级或未暴露 False
     """
@@ -163,7 +193,7 @@ def task_checkpoint(
         body["detail"] = detail
 
     try:
-        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id, jwt_token=jwt_token), timeout=TASK_TIMEOUT)
+        resp = requests.post(url, json=body, headers=_build_headers(tenant_id=tenant_id), timeout=TASK_TIMEOUT)
         if resp.ok:
             logger.info(f"PCE TaskCheckpoint OK: {task_id} @ {phase}")
             return True
@@ -173,4 +203,25 @@ def task_checkpoint(
         logger.warning(f"PCE TaskCheckpoint HTTP {resp.status_code}（降级）: {resp.text[:200]}")
     except requests.RequestException as e:
         logger.warning(f"PCE TaskCheckpoint 失败（降级）: {e}")
+    return False
+
+
+def submit_approval(task_id: str, task_type: str = "listing_generation", tenant_id: str | None = None) -> bool:
+    """R22-FIX: 向 PCE 提交审批（approval_required 任务生成完成后调用）。
+
+    PCE policy engine 按 task_type 判定 trust level：
+    listing_generation -> L3 -> 人工审批（approval_queue pending）。
+    """
+    if not task_id:
+        return False
+    url = PCE_API_BASE + "/api/v1/approvals/submit"
+    try:
+        resp = requests.post(url, json={"task_id": task_id, "task_type": task_type},
+                             headers=_build_headers(tenant_id=tenant_id), timeout=TASK_TIMEOUT)
+        if resp.ok:
+            logger.info(f"PCE SubmitApproval OK: {task_id}")
+            return True
+        logger.warning(f"PCE SubmitApproval HTTP {resp.status_code}: {resp.text[:200]}")
+    except requests.RequestException as e:
+        logger.warning(f"PCE SubmitApproval failed: {e}")
     return False

@@ -106,7 +106,7 @@ def set_status(
     Returns:
         bool: 成功 True，task 不存在 False
     """
-    valid = {"pending", "running", "completed", "failed"}
+    valid = {"pending", "running", "completed", "failed", "waiting_approval", "cancelled"}
     if status not in valid:
         logger.error(f"[task-state] Invalid status '{status}', must be one of {valid}")
         return False

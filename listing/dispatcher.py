@@ -70,6 +70,7 @@ def enqueue(
     payload: dict,
     work_fn: Callable[[dict], dict],
     pce_task_id: str | None = None,
+    approval_required: bool = False,
 ) -> bool:
     """入队一个异步任务。
 
@@ -103,9 +104,21 @@ def enqueue(
             result = work_fn(payload)
             add_checkpoint(task_id, "work_completed", {"result_keys": list(result.keys()) if isinstance(result, dict) else []})
 
-            set_status(task_id, "completed", result=result)
-            add_checkpoint(task_id, "task_finalized")
-            _sync_pce("completed")
+            if approval_required:
+                # R22-FIX: 需审批任务生成完成后进入 waiting_approval，提交 PCE 审批队列
+                set_status(task_id, "waiting_approval", result=result)
+                add_checkpoint(task_id, "awaiting_approval")
+                _sync_pce("waiting_approval")
+                if pce_task_id:
+                    try:
+                        from pce_task_client import submit_approval
+                        submit_approval(pce_task_id, "listing_generation", tenant_id=tenant_id)
+                    except Exception as ae:
+                        logger.warning(f"[dispatcher] SubmitApproval failed ({pce_task_id}): {ae}")
+            else:
+                set_status(task_id, "completed", result=result)
+                add_checkpoint(task_id, "task_finalized")
+                _sync_pce("completed")
 
         except Exception as e:
             logger.error(f"[dispatcher] Task {task_id} failed: {e}", exc_info=True)
