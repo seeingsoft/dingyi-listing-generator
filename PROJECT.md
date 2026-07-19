@@ -15,20 +15,20 @@
 - **SSH 密码**：`DingYi_aiagent_20260602`
 - **标准 SSH 连接**：
   ```bash
-  sshpass -p 'DingYi_aiagent_20260602' ssh -o StrictHostKeyChecking=no root@120.79.20.232
+> [REDACTED: inline development credential removed] Credentials are injected outside Git through a user-controlled development secret store.
   ```
 - **本 Worker 部署路径**：`/opt/tools/tool-amazon/listing/`（与 ISR 同仓库 `tool-amazon`）
 - **部署命令**：
   ```bash
-  sshpass -p 'DingYi_aiagent_20260602' rsync -avz --delete \
+> [REDACTED: inline development credential removed] Credentials are injected outside Git through a user-controlled development secret store.
     -e "ssh -o StrictHostKeyChecking=no" \
     . root@120.79.20.232:/opt/tools/tool-amazon/listing/
   ```
-- **服务重启**：`sshpass -p 'DingYi_aiagent_20260602' ssh -o StrictHostKeyChecking=no root@120.79.20.232 "systemctl restart tool-amazon-prod"`
+> [REDACTED: inline development credential removed] Credentials are injected outside Git through a user-controlled development secret store.
   > ⚠️ 当前设计与 ISR 同库同服务；若改为独立 Gunicorn 服务，需新建 `dingyi-listing.service` 并新增 Nginx `location /listing/`
 - **Nginx 反代**：待添加 `location /listing/ { proxy_pass http://127.0.0.1:5000/listing/; }` 至 `/etc/nginx/sites-enabled/ai-dashboard`（或独立 server block）
 - **健康检查**：`curl https://ai.hydrationflask.cn/listing/health`
-- **回滚**：`sshpass -p 'DingYi_aiagent_20260602' ssh -o StrictHostKeyChecking=no root@120.79.20.232 "cp -r /opt/tools/tool-amazon/listing /opt/tools/tool-amazon/listing.bak.$(date +%Y%m%d_%H%M)"`
+> [REDACTED: inline development credential removed] Credentials are injected outside Git through a user-controlled development secret store.
 
 ## 技术栈
 
